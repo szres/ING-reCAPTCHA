@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS pending_verifications (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     message_id INTEGER,
+    join_message_id INTEGER,
     correct_labels TEXT NOT NULL,
     current_step INTEGER DEFAULT 0,
     user_answers TEXT DEFAULT '[]',
@@ -128,10 +130,62 @@ SELECT id, 'zh', label FROM image_sets;
 -- Clean up any invalid pending_verifications with non-integer expires_at
 -- (leftover from pre-migration-003 data)
 DELETE FROM pending_verifications WHERE CAST(expires_at AS TEXT) LIKE '%-%';
+
+-- Leaderboard table to track test completion times
+CREATE TABLE IF NOT EXISTS leaderboard (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    last_name TEXT,
+    completion_time_ms INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    UNIQUE(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_leaderboard_time ON leaderboard(completion_time_ms ASC);
+CREATE INDEX IF NOT EXISTS idx_leaderboard_completed ON leaderboard(completed_at DESC);
+
+-- Verification events: one row per terminal outcome (passed/failed/expired)
+CREATE TABLE IF NOT EXISTS verification_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('passed', 'failed', 'expired')),
+    completion_time_ms INTEGER,
+    failed_at_step INTEGER,
+    is_test INTEGER NOT NULL DEFAULT 0,
+    user_lang TEXT,
+    regenerated INTEGER NOT NULL DEFAULT 0,
+    admin_user_id INTEGER,
+    occurred_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_test_occurred ON verification_events(is_test, occurred_at);
 `
 	_, err := db.Exec(migration)
 	if err != nil {
 		return fmt.Errorf("failed to run migration: %w", err)
 	}
+
+	// Additive column migrations for existing deployments.
+	// "duplicate column name" is expected on subsequent runs; any other error is real.
+	additiveColumns := []struct {
+		table, column, ddl string
+	}{
+		{"pending_verifications", "join_message_id", "ALTER TABLE pending_verifications ADD COLUMN join_message_id INTEGER"},
+		{"pending_verifications", "is_test", "ALTER TABLE pending_verifications ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0"},
+		{"pending_verifications", "user_lang", "ALTER TABLE pending_verifications ADD COLUMN user_lang TEXT"},
+		{"pending_verifications", "regenerated", "ALTER TABLE pending_verifications ADD COLUMN regenerated INTEGER NOT NULL DEFAULT 0"},
+		{"pending_verifications", "challenge_version", "ALTER TABLE pending_verifications ADD COLUMN challenge_version INTEGER NOT NULL DEFAULT 0"},
+		{"verification_events", "regenerated", "ALTER TABLE verification_events ADD COLUMN regenerated INTEGER NOT NULL DEFAULT 0"},
+		{"verification_events", "admin_user_id", "ALTER TABLE verification_events ADD COLUMN admin_user_id INTEGER"},
+	}
+	for _, c := range additiveColumns {
+		if _, err := db.Exec(c.ddl); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("failed to add %s.%s column: %w", c.table, c.column, err)
+		}
+	}
+
 	return nil
 }

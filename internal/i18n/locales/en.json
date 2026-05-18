@@ -48,14 +48,18 @@
   "cache_missing_empty": "✅ No images pending cache",
   "cache_missing_done": "✅ Cache backfill finished\nProcessed: %d\nSuccess: %d\nFailed: %d",
 
-  "verify_welcome": "👋 Welcome <b>%s</b>!\n\nPlease complete verification within %d seconds.\nThe image shows %d pictures (labeled 1, 2, 3).\n\n<b>Please select the correct label for each picture in order.</b>\n\nCurrent: Select the label for picture <b>1</b>",
+  "verify_welcome": "👋 Welcome %s!\n\nPlease complete verification within %d seconds.\nThe image shows %d pictures (labeled 1, 2, 3).\n\n<b>Please select the correct label for each picture in order.</b>\n\nCurrent: Select the label for picture <b>1</b>",
   "verify_step_prompt": "👋 Verification in progress...\n\nSelected %d/%d\n\n<b>Select the label for picture %d</b>",
   "verify_callback_selected": "Selected: %s",
   "verify_callback_not_yours": "This is not your verification!",
   "verify_callback_expired": "Verification has expired or does not exist",
   "verify_callback_order": "Please select in order",
-  "verify_passed": "✅ Verification passed! Welcome <b>%s</b> to the group.",
+  "verify_passed": "✅ Verification passed! Welcome %s to the group.",
   "verify_passed_callback": "Verification passed!",
+  "test_completion_time": "⏱ Completion time: %s seconds",
+  "test_percentile": "🎯 Better than %s%% of agents",
+  "test_retry_link": "<a href=\"https://%s\">Try again</a>",
+  "test_leaderboard_link": "<a href=\"%s\">View Leaderboard</a>",
   "verify_failed_test": "Verification failed (test mode)",
   "verify_failed_kicked": "Verification failed, removed from group (you may rejoin)",
   "verify_failed_banned": "Verification failed, permanently removed from group",
@@ -96,5 +100,27 @@
   "err_usage_dellabel": "❌ Usage: /dellabel &lt;image_set&gt; &lt;language_code&gt;",
   "err_usage_listlabels": "❌ Usage: /listlabels &lt;image_set&gt;",
 
-  "cmd_help_i18n": "<b>Language Settings:</b>\n/setlang &lt;code&gt; - Set interface language\n/addlabel &lt;set&gt; &lt;lang&gt; &lt;label&gt; - Add label translation\n/listlabels &lt;set&gt; - View label translations\n/dellabel &lt;set&gt; &lt;lang&gt; - Delete label translation\n/cachemissing [&lt;count&gt;] - Backfill uncached historical images\n\n"
+  "cmd_help_i18n": "<b>Language Settings:</b>\n/setlang &lt;code&gt; - Set interface language\n/addlabel &lt;set&gt; &lt;lang&gt; &lt;label&gt; - Add label translation\n/listlabels &lt;set&gt; - View label translations\n/dellabel &lt;set&gt; &lt;lang&gt; - Delete label translation\n/cachemissing [&lt;count&gt;] - Backfill uncached historical images\n\n",
+
+  "verify_regenerate_button": "🔄 Try different pictures",
+  "verify_regenerate_toast": "Generating new questions…",
+  "verify_regenerate_used": "You've already used your one regenerate.",
+  "verify_regenerate_failed": "❌ Failed to generate new questions, please continue with the current ones.",
+
+  "verify_admin_approve_button": "✅ Approve",
+  "verify_admin_ban_button": "🚫 Ban",
+  "verify_admin_only": "Only group admins can use this.",
+  "verify_admin_approved_toast": "Approved",
+  "verify_admin_banned_toast": "Banned",
+  "verify_admin_approved_msg": "✅ Approved by admin.",
+  "verify_admin_banned_msg": "🚫 Banned by admin.",
+
+  "daily_stats_title": "📊 <b>Daily Stats — %s</b>",
+  "daily_stats_passed": "✅ Passed: %d (%.1f%%)",
+  "daily_stats_failed": "❌ Failed: %d (%.1f%%)",
+  "daily_stats_expired": "⏰ Expired: %d (%.1f%%)",
+  "daily_stats_times": "⏱ Avg: %.2fs | Median: %.2fs | P95: %.2fs",
+  "daily_stats_fastest": "⚡ Fastest: %.2fs",
+  "daily_stats_unique_users": "👥 Unique agents: %d",
+  "daily_stats_empty": "📭 No verifications."
 }

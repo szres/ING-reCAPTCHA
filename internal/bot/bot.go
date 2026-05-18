@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -23,13 +24,21 @@ type Bot struct {
 	composer *imaging.Composer
 	i18n     *i18n.Translator
 
+	// joinMsgCache buffers join service message IDs for the race condition where
+	// new_chat_members arrives before handleChatMemberUpdate creates the DB record.
+	// Key: "chatID:userID", Value: int (message ID)
+	joinMsgCache sync.Map
+
 	workerPool chan struct{}
+	updatePool chan struct{}
 	stopChan   chan struct{}
 	wg         sync.WaitGroup
 }
 
 func New(cfg *config.Config, db *database.DB) (*Bot, error) {
-	rawAPI, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
+	// Keep timeout above long-poll update timeout (60s) to avoid cancelling getUpdates early.
+	httpClient := &http.Client{Timeout: 90 * time.Second}
+	rawAPI, err := tgbotapi.NewBotAPIWithClient(cfg.TelegramBotToken, tgbotapi.APIEndpoint, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot API: %w", err)
 	}
@@ -50,6 +59,7 @@ func New(cfg *config.Config, db *database.DB) (*Bot, error) {
 		composer:   imaging.NewComposer(cfg.ImageCachePath),
 		i18n:       translator,
 		workerPool: make(chan struct{}, 5),
+		updatePool: make(chan struct{}, 64),
 		stopChan:   make(chan struct{}),
 	}, nil
 }
@@ -82,13 +92,25 @@ func (b *Bot) Start() error {
 	b.wg.Add(1)
 	go b.cleanupFailureHistory()
 
+	b.wg.Add(1)
+	go b.dailyStatsLoop()
+
 	log.Println("Bot started, listening for updates...")
 	log.Printf("Configuration: Images=%d, Required=%d, Timeout=%ds, Distractors=%d",
 		b.cfg.VerifyImageCount, b.cfg.VerifyRequiredCorrect,
 		b.cfg.VerifyTimeoutSeconds, b.cfg.VerifyDistractorCount)
 
 	for update := range updates {
-		go b.handleUpdate(update)
+		b.updatePool <- struct{}{}
+		go func(update tgbotapi.Update) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[ERROR] Panic in update handler: %v", r)
+				}
+				<-b.updatePool
+			}()
+			b.handleUpdate(update)
+		}(update)
 	}
 
 	return nil
@@ -163,6 +185,18 @@ func (b *Bot) handleExpiredVerification(pv *database.PendingVerification) {
 	}
 	log.Printf("[DEBUG] Claimed pending verification record for user %d", pv.UserID)
 
+	if err := b.db.RecordVerificationEvent(database.VerificationEvent{
+		ChatID:      pv.ChatID,
+		UserID:      pv.UserID,
+		Outcome:     "expired",
+		IsTest:      pv.IsTest,
+		UserLang:    pv.UserLang,
+		Regenerated: pv.Regenerated,
+		OccurredAt:  time.Now().Unix(),
+	}); err != nil {
+		log.Printf("[ERROR] Failed to record expired verification event: %v", err)
+	}
+
 	// Delete verification message if exists
 	if pv.MessageID.Valid {
 		messageID := int(pv.MessageID.Int64)
@@ -213,51 +247,43 @@ func (b *Bot) handleExpiredVerification(pv *database.PendingVerification) {
 		}
 
 		log.Printf("[INFO] User %d timed out (2nd time) in chat %d and was permanently banned", pv.UserID, pv.ChatID)
+		b.deleteJoinMessage(pv.ChatID, pv)
 	} else {
-		// First failure - kick without ban (can rejoin immediately)
-		log.Printf("[INFO] User %d first timeout, kicking without ban", pv.UserID)
+		// First failure - tempban (kick with UntilDate). Telegram auto-lifts
+		// the ban when UntilDate passes, so we do NOT call unbanChatMember.
+		// Manual unban was found to leave the user's pre-scheduled messages
+		// queued and they would fire after the unban, bypassing verification
+		// entirely. A real ban (even short) clears the queued scheduled
+		// messages, and the auto-expire lets legitimate users rejoin freely.
+		tempbanUntil := time.Now().Add(time.Duration(b.cfg.VerifyTempbanSeconds) * time.Second).Unix()
+		log.Printf("[INFO] User %d first timeout, tempbanning until %d (%ds)", pv.UserID, tempbanUntil, b.cfg.VerifyTempbanSeconds)
 
-		// Record the failure
-		if err := b.db.RecordVerificationFailure(pv.ChatID, pv.UserID); err != nil {
-			log.Printf("[ERROR] Failed to record verification failure: %v", err)
-		}
-
-		// Kick user (permanent ban first)
 		kickConfig := tgbotapi.KickChatMemberConfig{
 			ChatMemberConfig: tgbotapi.ChatMemberConfig{
 				ChatID: pv.ChatID,
 				UserID: pv.UserID,
 			},
-			// No UntilDate = permanent ban
+			UntilDate: tempbanUntil,
 		}
 		resp, err := b.api.Request(kickConfig)
 		if err != nil {
-			log.Printf("[ERROR] Failed to kick user %d from chat %d: %v", pv.UserID, pv.ChatID, err)
+			log.Printf("[ERROR] Failed to tempban user %d from chat %d: %v", pv.UserID, pv.ChatID, err)
 		} else {
-			log.Printf("[DEBUG] Successfully kicked user %d, response: %+v", pv.UserID, resp)
+			log.Printf("[DEBUG] Successfully tempbanned user %d, response: %+v", pv.UserID, resp)
 
-			// Only delete join history if kick succeeded (before unban to minimize race window)
+			// Only record failure after kick succeeds; if user was already removed by
+			// another anti-spam bot, do not poison local failure state.
+			if err := b.db.RecordVerificationFailure(pv.ChatID, pv.UserID); err != nil {
+				log.Printf("[ERROR] Failed to record verification failure: %v", err)
+			}
+
 			if err := b.db.DeleteUserJoinHistory(pv.ChatID, pv.UserID); err != nil {
 				log.Printf("[ERROR] Failed to delete join history: %v", err)
 			}
-
-			// Immediately unban to allow rejoin
-			unbanConfig := tgbotapi.UnbanChatMemberConfig{
-				ChatMemberConfig: tgbotapi.ChatMemberConfig{
-					ChatID: pv.ChatID,
-					UserID: pv.UserID,
-				},
-				OnlyIfBanned: true,
-			}
-			unbanResp, err := b.api.Request(unbanConfig)
-			if err != nil {
-				log.Printf("[ERROR] Failed to unban user %d: %v", pv.UserID, err)
-			} else {
-				log.Printf("[DEBUG] Successfully unbanned user %d (can rejoin), response: %+v", pv.UserID, unbanResp)
-			}
 		}
 
-		log.Printf("[INFO] User %d timed out (1st time) in chat %d and was kicked (no ban)", pv.UserID, pv.ChatID)
+		log.Printf("[INFO] User %d timed out (1st time) in chat %d and was tempbanned (%ds)", pv.UserID, pv.ChatID, b.cfg.VerifyTempbanSeconds)
+		b.deleteJoinMessage(pv.ChatID, pv)
 	}
 }
 

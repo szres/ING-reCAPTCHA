@@ -7,7 +7,21 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-func (b *Bot) cmdStart(msg *tgbotapi.Message) {
+func (b *Bot) cmdStart(msg *tgbotapi.Message, args string) {
+	// Handle deep links like /start test or /start retry_test
+	args = strings.TrimSpace(args)
+	
+	if args == "test" || args == "retry_test" {
+		// Only allow in private chat
+		if msg.Chat.Type == "private" {
+			if err := b.startTestVerification(msg.Chat.ID, msg.From.ID, msg.From); err != nil {
+				b.sendMessage(msg.Chat.ID, b.t(msg.From, "err_test_start_failed", err))
+			}
+			return
+		}
+	}
+	
+	// Default welcome message
 	reply := tgbotapi.NewMessage(msg.Chat.ID, b.t(msg.From, "cmd_start_welcome"))
 	reply.ParseMode = "HTML"
 	b.api.Send(reply)
@@ -213,18 +227,16 @@ func (b *Bot) cmdSetStats(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) cmdTest(msg *tgbotapi.Message) {
-	if !b.canManageBot(msg) {
-		b.sendMessage(msg.Chat.ID, b.t(msg.From, "err_permission_denied"))
-		return
+	// Allow all users to test in private chat
+	// Only require admin permission in groups
+	if msg.Chat.Type == "group" || msg.Chat.Type == "supergroup" {
+		if !b.canManageBot(msg) {
+			b.sendMessage(msg.Chat.ID, b.t(msg.From, "err_permission_denied"))
+			return
+		}
 	}
 
-	// Only works in groups
-	if msg.Chat.Type != "group" && msg.Chat.Type != "supergroup" {
-		b.sendMessage(msg.Chat.ID, b.t(msg.From, "err_test_group_only"))
-		return
-	}
-
-	// Start test verification for the admin (won't restrict permissions)
+	// Start test verification (works in both groups and private chat)
 	if err := b.startTestVerification(msg.Chat.ID, msg.From.ID, msg.From); err != nil {
 		b.sendMessage(msg.Chat.ID, b.t(msg.From, "err_test_start_failed", err))
 		return

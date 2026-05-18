@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -9,22 +10,106 @@ import (
 )
 
 func (b *Bot) handleMessage(msg *tgbotapi.Message) {
+	// Debug: log all message types to diagnose join message handling
+	if len(msg.NewChatMembers) > 0 {
+		log.Printf("[DEBUG] Received new_chat_members message: %d members, message ID: %d", len(msg.NewChatMembers), msg.MessageID)
+	}
+
 	if msg.IsCommand() {
 		b.handleCommand(msg)
 		return
 	}
 
-	// Check if user is pending verification and delete their messages
-	if msg.Chat.Type == "group" || msg.Chat.Type == "supergroup" {
-		pv, err := b.db.GetPendingVerification(msg.Chat.ID, msg.From.ID)
-		if err != nil {
-			log.Printf("Error checking pending verification: %v", err)
-			return
+	if msg.Chat.Type != "group" && msg.Chat.Type != "supergroup" {
+		return
+	}
+
+	// Store join service message ID so it can be deleted on verification failure.
+	// Do not delete immediately — the message is kept if the user passes.
+	// Due to a race condition (new_chat_members may arrive before the pending
+	// verification DB record is created by handleChatMemberUpdate), we always
+	// buffer the ID in joinMsgCache. The DB update is also attempted; if the
+	// record doesn't exist yet, handleChatMemberUpdate will drain the cache.
+	if len(msg.NewChatMembers) > 0 {
+		for _, member := range msg.NewChatMembers {
+			log.Printf("[DEBUG] Processing new_chat_member: user %d (%s) in chat %d", member.ID, member.FirstName, msg.Chat.ID)
+			key := fmt.Sprintf("%d:%d", msg.Chat.ID, member.ID)
+			b.joinMsgCache.Store(key, msg.MessageID)
+			log.Printf("[DEBUG] Stored join message ID %d in cache for key %s", msg.MessageID, key)
+			if err := b.db.UpdateJoinMessageID(msg.Chat.ID, member.ID, msg.MessageID); err != nil {
+				log.Printf("[WARN] Failed to store join message ID for user %d: %v", member.ID, err)
+			} else {
+				log.Printf("[DEBUG] Successfully stored join message ID %d in DB for user %d", msg.MessageID, member.ID)
+			}
 		}
-		if pv != nil {
-			// User is pending verification, delete their message
-			deleteMsg := tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)
-			b.api.Request(deleteMsg)
+		return
+	}
+
+	// Anonymous channel post (sender_chat). Telegram routes channel admins
+	// posting as the channel here, not as a user. Log distinctly so post-hoc
+	// forensics can tell user-spam from channel-spam.
+	if msg.From == nil {
+		if msg.SenderChat != nil {
+			log.Printf("[DEBUG] Anonymous/channel post in chat %d from sender_chat=%d (%s) msg_id=%d",
+				msg.Chat.ID, msg.SenderChat.ID, msg.SenderChat.Title, msg.MessageID)
+		}
+		return
+	}
+
+	// Check pending verification first — those messages are mid-CAPTCHA chatter
+	// and just need silent deletion. Tombstone re-tempban below would otherwise
+	// re-kick a user who's legitimately trying again after a first failure.
+	pv, err := b.db.GetPendingVerification(msg.Chat.ID, msg.From.ID)
+	if err != nil {
+		log.Printf("Error checking pending verification: %v", err)
+		return
+	}
+	if pv != nil {
+		deleteMsg := tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)
+		b.api.Request(deleteMsg)
+		return
+	}
+
+	// Tombstone filter: a user with a verification_failures row should be
+	// tempbanned at the Telegram level right now. If a message still arrives,
+	// it's either a ghost-fire of a scheduled message that survived the
+	// tempban, a silently-rejoined member whose chat_member update was
+	// dropped, or a Telegram delivery race. Delete + re-tempban, and log
+	// enough state to disambiguate after the fact.
+	hasFailure, err := b.db.HasPreviousFailure(msg.Chat.ID, msg.From.ID)
+	if err != nil {
+		log.Printf("[WARN] Tombstone check failed for user %d: %v", msg.From.ID, err)
+	} else if hasFailure {
+		var memberStatus string
+		if member, mErr := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+			ChatConfigWithUser: tgbotapi.ChatConfigWithUser{ChatID: msg.Chat.ID, UserID: msg.From.ID},
+		}); mErr != nil {
+			memberStatus = "<getChatMember error: " + mErr.Error() + ">"
+		} else {
+			memberStatus = member.Status
+		}
+		previewLen := 80
+		if len(msg.Text) < previewLen {
+			previewLen = len(msg.Text)
+		}
+		log.Printf("[WARN] Tombstone hit: msg from user %d in chat %d (status=%s) msg_id=%d date=%d text_preview=%q",
+			msg.From.ID, msg.Chat.ID, memberStatus, msg.MessageID, msg.Date, msg.Text[:previewLen])
+
+		// Delete the offending message.
+		if _, dErr := b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)); dErr != nil {
+			log.Printf("[ERROR] Tombstone delete failed for msg %d: %v", msg.MessageID, dErr)
+		}
+
+		// Re-tempban to extend the window and clear any other queued scheduled
+		// messages. Idempotent — re-banning an already-banned user is a no-op.
+		tempbanUntil := time.Now().Add(time.Duration(b.cfg.VerifyTempbanSeconds) * time.Second).Unix()
+		if _, bErr := b.api.Request(tgbotapi.KickChatMemberConfig{
+			ChatMemberConfig: tgbotapi.ChatMemberConfig{ChatID: msg.Chat.ID, UserID: msg.From.ID},
+			UntilDate:        tempbanUntil,
+		}); bErr != nil {
+			log.Printf("[ERROR] Tombstone re-tempban failed for user %d: %v", msg.From.ID, bErr)
+		} else {
+			log.Printf("[INFO] Tombstone re-tempbanned user %d until %d", msg.From.ID, tempbanUntil)
 		}
 	}
 }
@@ -35,7 +120,7 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 
 	switch cmd {
 	case "start":
-		b.cmdStart(msg)
+		b.cmdStart(msg, args)
 	case "help":
 		b.cmdHelp(msg)
 	case "addset":
@@ -76,15 +161,32 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 		update.OldChatMember.Status, update.NewChatMember.Status,
 		update.NewChatMember.User.ID, update.Chat.ID)
 
+	chatID := update.Chat.ID
+	userID := update.NewChatMember.User.ID
+	newStatus := update.NewChatMember.Status
+	oldStatus := update.OldChatMember.Status
+
+	// If user was removed by another anti-spam bot before finishing verification,
+	// clear pending state immediately to avoid stale timeout/failure side effects.
+	if (newStatus == "left" || newStatus == "kicked") &&
+		(oldStatus == "member" || oldStatus == "restricted" || oldStatus == "administrator" || oldStatus == "creator") {
+		log.Printf("[INFO] User %d left/was removed in chat %d (old=%s,new=%s), cleaning verification state",
+			userID, chatID, oldStatus, newStatus)
+		b.cleanupVerificationState(chatID, userID)
+		return
+	}
+
 	// Only handle new members joining
-	if update.NewChatMember.Status != "member" {
+	if newStatus != "member" {
 		log.Printf("[DEBUG] New status is not 'member', ignoring")
 		return
 	}
 
-	// Skip if old status was already member (not a new join)
-	if update.OldChatMember.Status == "member" {
-		log.Printf("[DEBUG] Old status was already 'member', ignoring")
+	// Only treat truly fresh joins as new joins. A "restricted → member" transition
+	// is just the unrestrict flow (admin approve, successful CAPTCHA, auto-approve)
+	// and must not kick off a second verification.
+	if oldStatus != "left" && oldStatus != "kicked" {
+		log.Printf("[DEBUG] Old status %q is not left/kicked, ignoring (not a fresh join)", oldStatus)
 		return
 	}
 
@@ -93,9 +195,6 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 		log.Printf("[DEBUG] User is a bot, ignoring")
 		return
 	}
-
-	chatID := update.Chat.ID
-	userID := update.NewChatMember.User.ID
 
 	log.Printf("[INFO] New member joined: user %d in chat %d", userID, chatID)
 
@@ -155,6 +254,135 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 		// Unrestrict user if verification fails to start
 		log.Printf("[DEBUG] Unrestricting user due to verification start failure")
 		b.unrestrictUser(chatID, userID)
+		return
+	}
+
+	// Drain cached join message ID that may have arrived before the DB record was created.
+	key := fmt.Sprintf("%d:%d", chatID, userID)
+	if msgID, ok := b.joinMsgCache.LoadAndDelete(key); ok {
+		if err := b.db.UpdateJoinMessageID(chatID, userID, msgID.(int)); err != nil {
+			log.Printf("[WARN] Failed to drain cached join message ID for user %d: %v", userID, err)
+		} else {
+			log.Printf("[DEBUG] Drained cached join message ID %v for user %d", msgID, userID)
+		}
+	}
+}
+
+func (b *Bot) cleanupVerificationState(chatID, userID int64) {
+	key := fmt.Sprintf("%d:%d", chatID, userID)
+
+	// Load and remove from cache (but keep the value for fallback)
+	cachedJoinMsgID, hasCached := b.joinMsgCache.LoadAndDelete(key)
+
+	// Get pending verification to retrieve message IDs before deletion
+	pv, err := b.db.GetPendingVerification(chatID, userID)
+	if err != nil {
+		log.Printf("[WARN] Failed to get pending verification for user %d: %v", userID, err)
+	}
+
+	// If no pending verification exists, nothing to clean up
+	if pv == nil {
+		log.Printf("[DEBUG] No pending verification found for user %d, skipping message cleanup", userID)
+		// Still clean up join history in case it exists
+		if err := b.db.DeleteUserJoinHistory(chatID, userID); err != nil {
+			log.Printf("[WARN] Failed to delete join history for user %d: %v", userID, err)
+		}
+		return
+	}
+
+	// If verification message hasn't been sent yet (MessageID is NULL),
+	// schedule a delayed cleanup to catch it after it's sent
+	if !pv.MessageID.Valid {
+		log.Printf("[DEBUG] Verification message not yet sent for user %d, scheduling delayed cleanup", userID)
+		go func() {
+			time.Sleep(10 * time.Second)
+			b.cleanupVerificationMessageDelayed(chatID, userID)
+		}()
+		// Don't delete pending verification yet - let delayed cleanup handle it
+	} else {
+		// Delete verification message immediately
+		messageID := int(pv.MessageID.Int64)
+		log.Printf("[DEBUG] Deleting verification message %d for removed user %d", messageID, userID)
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
+		if _, err := b.api.Request(deleteMsg); err != nil {
+			log.Printf("[WARN] Failed to delete verification message %d: %v", messageID, err)
+		} else {
+			log.Printf("[DEBUG] Successfully deleted verification message %d", messageID)
+		}
+
+		// Clean up database records immediately
+		if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
+			log.Printf("[WARN] Failed to delete pending verification for user %d: %v", userID, err)
+		}
+	}
+
+	// Delete join message if exists (prefer DB, fallback to cache)
+	var joinMsgID int
+	if pv.JoinMessageID.Valid {
+		joinMsgID = int(pv.JoinMessageID.Int64)
+	} else if hasCached {
+		if msgID, ok := cachedJoinMsgID.(int); ok {
+			joinMsgID = msgID
+		}
+	}
+
+	if joinMsgID > 0 {
+		log.Printf("[DEBUG] Deleting join message %d for removed user %d", joinMsgID, userID)
+		deleteMsg := tgbotapi.NewDeleteMessage(chatID, joinMsgID)
+		if _, err := b.api.Request(deleteMsg); err != nil {
+			log.Printf("[WARN] Failed to delete join message %d: %v", joinMsgID, err)
+		} else {
+			log.Printf("[DEBUG] Successfully deleted join message %d", joinMsgID)
+		}
+	}
+
+	// Always clean up join history
+	if err := b.db.DeleteUserJoinHistory(chatID, userID); err != nil {
+		log.Printf("[WARN] Failed to delete join history for user %d: %v", userID, err)
+	}
+}
+
+// cleanupVerificationMessageDelayed attempts to delete a verification message
+// after a delay, used when the message hasn't been sent yet during initial cleanup
+func (b *Bot) cleanupVerificationMessageDelayed(chatID, userID int64) {
+	log.Printf("[DEBUG] Delayed cleanup: checking for verification message for user %d", userID)
+
+	// Check if pending verification still exists
+	pv, err := b.db.GetPendingVerification(chatID, userID)
+	if err != nil {
+		log.Printf("[WARN] Delayed cleanup: failed to get pending verification for user %d: %v", userID, err)
+		return
+	}
+
+	// If no pending verification, it was already cleaned up by another path
+	if pv == nil {
+		log.Printf("[DEBUG] Delayed cleanup: no pending verification for user %d, already cleaned up", userID)
+		return
+	}
+
+	// If message ID is still not set, give up (message send probably failed)
+	if !pv.MessageID.Valid {
+		log.Printf("[DEBUG] Delayed cleanup: verification message still not sent for user %d after delay, giving up", userID)
+		// Clean up the pending verification anyway
+		if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
+			log.Printf("[WARN] Delayed cleanup: failed to delete pending verification for user %d: %v", userID, err)
+		}
+		return
+	}
+
+	// Delete the verification message
+	messageID := int(pv.MessageID.Int64)
+	log.Printf("[DEBUG] Delayed cleanup: deleting verification message %d for user %d", messageID, userID)
+	deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
+	if _, err := b.api.Request(deleteMsg); err != nil {
+		log.Printf("[WARN] Delayed cleanup: failed to delete verification message %d: %v", messageID, err)
+	} else {
+		log.Printf("[DEBUG] Delayed cleanup: successfully deleted verification message %d", messageID)
+	}
+
+	// Clean up pending verification
+	if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
+		log.Printf("[WARN] Delayed cleanup: failed to delete pending verification for user %d: %v", userID, err)
 	}
 }
 
@@ -281,4 +509,20 @@ func escapeHTML(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	return s
+}
+
+func formatUserMention(user *tgbotapi.User) string {
+	if user == nil {
+		return ""
+	}
+
+	if user.UserName != "" {
+		return "@" + escapeHTML(user.UserName)
+	}
+
+	name := strings.TrimSpace(user.FirstName + " " + user.LastName)
+	if name == "" {
+		name = "user"
+	}
+	return fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>`, user.ID, escapeHTML(name))
 }

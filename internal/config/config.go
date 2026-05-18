@@ -17,8 +17,17 @@ type Config struct {
 	VerifyMaxRetry        int
 	VerifyDistractorCount int
 	RejoinCooldownSeconds int
-	DefaultLanguage       string
+	// VerifyTempbanSeconds is how long a user is tempbanned after a first
+	// verification failure. Using a tempban (KickChatMember with UntilDate)
+	// instead of kick+unban clears any scheduled messages they may have
+	// queued before/during the verification window. Telegram auto-lifts the
+	// ban after this duration, so legit users can rejoin organically.
+	VerifyTempbanSeconds int
+	DefaultLanguage      string
 	InitialAdminIDs       []int64
+	LeaderboardChannelID  int64
+	LeaderboardMessageID  int
+	DailyStatsTimezone    string
 }
 
 func Load() *Config {
@@ -32,8 +41,12 @@ func Load() *Config {
 		VerifyMaxRetry:        getEnvInt("VERIFY_MAX_RETRY", 1),
 		VerifyDistractorCount: getEnvInt("VERIFY_DISTRACTOR_COUNT", 3),
 		RejoinCooldownSeconds: getEnvInt("REJOIN_COOLDOWN_SECONDS", 300),
+		VerifyTempbanSeconds:  getEnvInt("VERIFY_TEMPBAN_SECONDS", 300),
 		DefaultLanguage:       getEnv("DEFAULT_LANGUAGE", "zh"),
 		InitialAdminIDs:       getEnvInt64List("BOT_ADMIN_IDS"),
+		LeaderboardChannelID:  getEnvInt64("LEADERBOARD_CHANNEL_ID", 0),
+		LeaderboardMessageID:  getEnvInt("LEADERBOARD_MESSAGE_ID", 0),
+		DailyStatsTimezone:    getEnv("DAILY_STATS_TIMEZONE", "Asia/Shanghai"),
 	}
 }
 
@@ -74,4 +87,14 @@ func getEnvInt64List(key string) []int64 {
 		}
 	}
 	return result
+}
+
+func getEnvInt64(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return intVal
+		}
+		log.Printf("Warning: invalid int64 value for %s: %s, using default %d", key, value, defaultValue)
+	}
+	return defaultValue
 }

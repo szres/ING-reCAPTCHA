@@ -13,12 +13,14 @@ import (
 )
 
 type mockTelegramAPI struct {
-	mu           sync.Mutex
-	sent         []tgbotapi.Chattable
-	requested    []tgbotapi.Chattable
-	chatMemberFn func(tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error)
-	sendErr      error
-	requestErr   error
+	mu                 sync.Mutex
+	sent               []tgbotapi.Chattable
+	requested          []tgbotapi.Chattable
+	deletedMessages    []int
+	deleteMessageCalled bool
+	chatMemberFn       func(tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error)
+	sendErr            error
+	requestErr         error
 }
 
 func (m *mockTelegramAPI) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
@@ -32,6 +34,13 @@ func (m *mockTelegramAPI) Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.requested = append(m.requested, c)
+
+	// Track delete message requests
+	if deleteMsg, ok := c.(tgbotapi.DeleteMessageConfig); ok {
+		m.deleteMessageCalled = true
+		m.deletedMessages = append(m.deletedMessages, deleteMsg.MessageID)
+	}
+
 	return &tgbotapi.APIResponse{Ok: true}, m.requestErr
 }
 
@@ -86,6 +95,7 @@ func newTestBot(t *testing.T) (*Bot, *mockTelegramAPI) {
 		},
 		i18n:       tr,
 		workerPool: make(chan struct{}, 5),
+		updatePool: make(chan struct{}, 8),
 		stopChan:   make(chan struct{}),
 	}
 	return b, mock

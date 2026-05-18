@@ -48,14 +48,18 @@
   "cache_missing_empty": "✅ 当前没有待缓存的图片",
   "cache_missing_done": "✅ 补缓存完成\n处理: %d\n成功: %d\n失败: %d",
 
-  "verify_welcome": "👋 欢迎 <b>%s</b>！\n\n请在 %d 秒内完成验证。\n图片中显示了 %d 张图片（标注 1、2、3）。\n\n<b>请依次为每张图片选择正确的标签。</b>\n\n当前：请选择图片 <b>1</b> 的标签",
+  "verify_welcome": "👋 欢迎 %s！\n\n请在 %d 秒内完成验证。\n图片中显示了 %d 张图片（标注 1、2、3）。\n\n<b>请依次为每张图片选择正确的标签。</b>\n\n当前：请选择图片 <b>1</b> 的标签",
   "verify_step_prompt": "👋 验证进行中...\n\n已选择 %d/%d\n\n<b>请选择图片 %d 的标签</b>",
   "verify_callback_selected": "已选择: %s",
   "verify_callback_not_yours": "这不是你的验证！",
   "verify_callback_expired": "验证已过期或不存在",
   "verify_callback_order": "请按顺序选择",
-  "verify_passed": "✅ 验证通过！欢迎 <b>%s</b> 加入群组。",
+  "verify_passed": "✅ 验证通过！欢迎 %s 加入群组。",
   "verify_passed_callback": "验证通过！",
+  "test_completion_time": "⏱ 完成时间：%s 秒",
+  "test_percentile": "🎯 超过了 %s%% 的特工",
+  "test_retry_link": "<a href=\"https://%s\">重试</a>",
+  "test_leaderboard_link": "<a href=\"%s\">查看排行榜</a>",
   "verify_failed_test": "验证失败（测试模式）",
   "verify_failed_kicked": "验证失败，已被移出群组（可重新加入）",
   "verify_failed_banned": "验证失败，已被永久移出群组",
@@ -96,5 +100,27 @@
   "err_usage_dellabel": "❌ 用法: /dellabel &lt;图片集&gt; &lt;语言代码&gt;",
   "err_usage_listlabels": "❌ 用法: /listlabels &lt;图片集&gt;",
 
-  "cmd_help_i18n": "<b>语言设置：</b>\n/setlang &lt;代码&gt; - 设置界面语言\n/addlabel &lt;集合&gt; &lt;语言&gt; &lt;标签&gt; - 添加标签翻译\n/listlabels &lt;集合&gt; - 查看标签翻译\n/dellabel &lt;集合&gt; &lt;语言&gt; - 删除标签翻译\n/cachemissing [&lt;数量&gt;] - 补齐历史未缓存图片\n\n"
+  "cmd_help_i18n": "<b>语言设置：</b>\n/setlang &lt;代码&gt; - 设置界面语言\n/addlabel &lt;集合&gt; &lt;语言&gt; &lt;标签&gt; - 添加标签翻译\n/listlabels &lt;集合&gt; - 查看标签翻译\n/dellabel &lt;集合&gt; &lt;语言&gt; - 删除标签翻译\n/cachemissing [&lt;数量&gt;] - 补齐历史未缓存图片\n\n",
+
+  "verify_regenerate_button": "🔄 换一组图片",
+  "verify_regenerate_toast": "正在生成新题目…",
+  "verify_regenerate_used": "你已使用过换题机会。",
+  "verify_regenerate_failed": "❌ 换题失败，请继续作答当前题目。",
+
+  "verify_admin_approve_button": "✅ 通过",
+  "verify_admin_ban_button": "🚫 封禁",
+  "verify_admin_only": "仅群组管理员可操作。",
+  "verify_admin_approved_toast": "已通过",
+  "verify_admin_banned_toast": "已封禁",
+  "verify_admin_approved_msg": "✅ 管理员已通过验证。",
+  "verify_admin_banned_msg": "🚫 管理员已封禁该用户。",
+
+  "daily_stats_title": "📊 <b>每日统计 — %s</b>",
+  "daily_stats_passed": "✅ 通过：%d (%.1f%%)",
+  "daily_stats_failed": "❌ 失败：%d (%.1f%%)",
+  "daily_stats_expired": "⏰ 超时：%d (%.1f%%)",
+  "daily_stats_times": "⏱ 平均：%.2fs | 中位：%.2fs | P95：%.2fs",
+  "daily_stats_fastest": "⚡ 最快：%.2fs",
+  "daily_stats_unique_users": "👥 独立特工：%d",
+  "daily_stats_empty": "📭 当日无验证。"
 }

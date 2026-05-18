@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -28,7 +29,7 @@ func TestBuildVerificationKeyboard(t *testing.T) {
 
 	t.Run("3 options produce 2 rows (2+1)", func(t *testing.T) {
 		opts := []string{"cat", "dog", "bird"}
-		kb := b.buildVerificationKeyboard(100, 0, opts, "en")
+		kb := b.buildVerificationKeyboard(100, 0, 0, opts, "en", false, false)
 		require.Len(t, kb.InlineKeyboard, 2)
 		assert.Len(t, kb.InlineKeyboard[0], 2)
 		assert.Len(t, kb.InlineKeyboard[1], 1)
@@ -36,7 +37,7 @@ func TestBuildVerificationKeyboard(t *testing.T) {
 
 	t.Run("4 options produce 2 rows of 2", func(t *testing.T) {
 		opts := []string{"cat", "dog", "bird", "fish"}
-		kb := b.buildVerificationKeyboard(100, 0, opts, "en")
+		kb := b.buildVerificationKeyboard(100, 0, 0, opts, "en", false, false)
 		require.Len(t, kb.InlineKeyboard, 2)
 		assert.Len(t, kb.InlineKeyboard[0], 2)
 		assert.Len(t, kb.InlineKeyboard[1], 2)
@@ -44,83 +45,120 @@ func TestBuildVerificationKeyboard(t *testing.T) {
 
 	t.Run("6 options produce 3 rows of 2", func(t *testing.T) {
 		opts := []string{"cat", "dog", "bird", "fish", "lion", "bear"}
-		kb := b.buildVerificationKeyboard(100, 0, opts, "en")
+		kb := b.buildVerificationKeyboard(100, 0, 0, opts, "en", false, false)
 		require.Len(t, kb.InlineKeyboard, 3)
 		assert.Len(t, kb.InlineKeyboard[0], 2)
 		assert.Len(t, kb.InlineKeyboard[1], 2)
 		assert.Len(t, kb.InlineKeyboard[2], 2)
 	})
 
-	t.Run("callback data format is v:{userID}:{step}:{label}", func(t *testing.T) {
+	t.Run("callback data format is v:{userID}:{ver}:{step}:{label}", func(t *testing.T) {
 		opts := []string{"cat"}
-		kb := b.buildVerificationKeyboard(42, 7, opts, "en")
+		kb := b.buildVerificationKeyboard(42, 7, 3, opts, "en", false, false)
 		require.Len(t, kb.InlineKeyboard, 1)
 		require.Len(t, kb.InlineKeyboard[0], 1)
 		btn := kb.InlineKeyboard[0][0]
 		require.NotNil(t, btn.CallbackData)
-		assert.Equal(t, "v:42:7:cat", *btn.CallbackData)
+		assert.Equal(t, "v:42:3:7:cat", *btn.CallbackData)
 	})
 
-	t.Run("step is encoded correctly in all buttons", func(t *testing.T) {
+	t.Run("step and version are encoded correctly in all buttons", func(t *testing.T) {
 		opts := []string{"cat", "dog", "bird"}
-		kb := b.buildVerificationKeyboard(99, 2, opts, "en")
+		kb := b.buildVerificationKeyboard(99, 2, 5, opts, "en", false, false)
 		for _, row := range kb.InlineKeyboard {
 			for _, btn := range row {
 				require.NotNil(t, btn.CallbackData)
-				assert.True(t, strings.HasPrefix(*btn.CallbackData, "v:99:2:"),
-					"expected prefix v:99:2: in %q", *btn.CallbackData)
+				assert.True(t, strings.HasPrefix(*btn.CallbackData, "v:99:5:2:"),
+					"expected prefix v:99:5:2: in %q", *btn.CallbackData)
 			}
 		}
 	})
+
+	t.Run("regenerate row is appended when showRegenerate is true", func(t *testing.T) {
+		opts := []string{"cat", "dog"}
+		kb := b.buildVerificationKeyboard(7, 0, 0, opts, "en", true, false)
+		require.Len(t, kb.InlineKeyboard, 2)
+		require.Len(t, kb.InlineKeyboard[1], 1)
+		btn := kb.InlineKeyboard[1][0]
+		require.NotNil(t, btn.CallbackData)
+		assert.Equal(t, "r:7:0", *btn.CallbackData)
+	})
+
+	t.Run("regenerate row is omitted when showRegenerate is false", func(t *testing.T) {
+		opts := []string{"cat", "dog"}
+		kb := b.buildVerificationKeyboard(7, 0, 0, opts, "en", false, false)
+		require.Len(t, kb.InlineKeyboard, 1)
+	})
+
+	t.Run("admin controls row is appended with two buttons when showAdminControls is true", func(t *testing.T) {
+		opts := []string{"cat", "dog"}
+		kb := b.buildVerificationKeyboard(7, 0, 5, opts, "en", false, true)
+		require.Len(t, kb.InlineKeyboard, 2)
+		require.Len(t, kb.InlineKeyboard[1], 2)
+		approveBtn := kb.InlineKeyboard[1][0]
+		banBtn := kb.InlineKeyboard[1][1]
+		require.NotNil(t, approveBtn.CallbackData)
+		require.NotNil(t, banBtn.CallbackData)
+		assert.Equal(t, "a:7:5", *approveBtn.CallbackData)
+		assert.Equal(t, "b:7:5", *banBtn.CallbackData)
+	})
+
+	t.Run("regenerate and admin rows can coexist (regenerate first)", func(t *testing.T) {
+		opts := []string{"cat", "dog"}
+		kb := b.buildVerificationKeyboard(7, 0, 0, opts, "en", true, true)
+		require.Len(t, kb.InlineKeyboard, 3)
+		require.Len(t, kb.InlineKeyboard[1], 1) // regenerate row
+		require.Len(t, kb.InlineKeyboard[2], 2) // admin row
+	})
 }
 
-func TestBuildMultiLangLabel(t *testing.T) {
+func TestPickLocalizedLabel(t *testing.T) {
 	tests := []struct {
 		name     string
 		labels   map[string]string
+		userLang string
 		fallback string
 		want     string
 	}{
 		{
-			name:     "empty labels returns fallback",
-			labels:   map[string]string{},
+			name:     "user lang present",
+			labels:   map[string]string{"zh": "猫", "en": "Cat"},
+			userLang: "en",
 			fallback: "cat",
-			want:     "cat",
+			want:     "Cat",
 		},
 		{
-			name:     "zh only",
-			labels:   map[string]string{"zh": "猫"},
+			name:     "user lang zh",
+			labels:   map[string]string{"zh": "猫", "en": "Cat"},
+			userLang: "zh",
 			fallback: "cat",
 			want:     "猫",
 		},
 		{
-			name:     "zh and en",
-			labels:   map[string]string{"zh": "猫", "en": "Cat"},
+			name:     "user lang missing falls back to raw label",
+			labels:   map[string]string{"zh": "猫"},
+			userLang: "en",
 			fallback: "cat",
-			want:     "猫 / Cat",
+			want:     "cat",
 		},
 		{
-			name:     "en only",
-			labels:   map[string]string{"en": "Cat"},
+			name:     "empty labels returns fallback",
+			labels:   map[string]string{},
+			userLang: "en",
 			fallback: "cat",
-			want:     "Cat",
+			want:     "cat",
 		},
 		{
-			name:     "duplicate values deduplicated",
-			labels:   map[string]string{"zh": "Cat", "en": "Cat"},
+			name:     "empty value treated as missing",
+			labels:   map[string]string{"en": ""},
+			userLang: "en",
 			fallback: "cat",
-			want:     "Cat",
-		},
-		{
-			name:     "zh en and extra language sorted",
-			labels:   map[string]string{"zh": "猫", "en": "Cat", "fr": "Chat"},
-			fallback: "cat",
-			want:     "猫 / Cat / Chat",
+			want:     "cat",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, buildMultiLangLabel(tc.labels, tc.fallback))
+			assert.Equal(t, tc.want, pickLocalizedLabel(tc.labels, tc.userLang, tc.fallback))
 		})
 	}
 }
@@ -137,7 +175,7 @@ func TestEvaluateVerification(t *testing.T) {
 		t.Helper()
 		b, mock := newTestBot(t)
 		// VerifyRequiredCorrect is 2 (set in newTestBot)
-		err := b.db.CreatePendingVerification(chatID, userID, correctLabels, time.Now().Add(time.Minute))
+		err := b.db.CreatePendingVerification(chatID, userID, correctLabels, time.Now().Add(time.Minute), false, "en")
 		require.NoError(t, err)
 		return b, mock
 	}
@@ -235,4 +273,26 @@ func TestEvaluateVerification(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, got, fmt.Sprintf("record for user %d in chat %d should be gone", userID, chatID))
 	})
+}
+
+func TestHandleVerificationFailure_KickError_DoesNotRecordFailure(t *testing.T) {
+	b, mock := newTestBot(t)
+	mock.requestErr = errors.New("telegram: bad request: user not found")
+
+	const (
+		chatID int64 = 200
+		userID int64 = 100
+	)
+
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	pv, err := b.db.GetPendingVerification(chatID, userID)
+	require.NoError(t, err)
+	require.NotNil(t, pv)
+
+	query := makeQuery(userID, chatID)
+	b.handleVerificationFailure(query, pv)
+
+	hasFail, err := b.db.HasPreviousFailure(chatID, userID)
+	require.NoError(t, err)
+	assert.False(t, hasFail, "kick error should not poison failure history")
 }
