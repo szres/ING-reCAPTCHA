@@ -77,6 +77,10 @@ func (b *Bot) Start() error {
 	}
 	log.Printf("Bot started as: @%s (ID: %d, Name: %s)", me.UserName, me.ID, me.FirstName)
 
+	if err := b.registerCommands(); err != nil {
+		log.Printf("[WARN] Failed to register bot commands with Telegram: %v", err)
+	}
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "callback_query", "chat_member"}
@@ -328,4 +332,35 @@ func (b *Bot) cleanupFailureHistory() {
 			}
 		}
 	}
+}
+
+// registerCommands publishes the bot's command list to Telegram so its
+// autocomplete UI offers /start@bot and /help@bot inside groups. Without
+// this the client never suggests the @username form and users only ever
+// type plain /start, which the bot now ignores in groups.
+func (b *Bot) registerCommands() error {
+	groupCmds := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Show welcome message and check setup"},
+		{Command: "help", Description: "Show help"},
+	}
+	privateCmds := []tgbotapi.BotCommand{
+		{Command: "start", Description: "Show welcome message"},
+		{Command: "help", Description: "Show help"},
+		{Command: "test", Description: "Run a test verification"},
+		{Command: "myid", Description: "Get your Telegram User ID"},
+		{Command: "setlang", Description: "Set interface language"},
+	}
+
+	if _, err := b.api.Request(tgbotapi.NewSetMyCommandsWithScope(
+		tgbotapi.NewBotCommandScopeAllGroupChats(), groupCmds...)); err != nil {
+		return fmt.Errorf("group scope: %w", err)
+	}
+	if _, err := b.api.Request(tgbotapi.NewSetMyCommandsWithScope(
+		tgbotapi.NewBotCommandScopeAllPrivateChats(), privateCmds...)); err != nil {
+		return fmt.Errorf("private scope: %w", err)
+	}
+
+	log.Printf("[INFO] Registered %d group commands and %d private commands with Telegram",
+		len(groupCmds), len(privateCmds))
+	return nil
 }

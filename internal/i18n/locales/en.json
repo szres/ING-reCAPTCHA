@@ -1,5 +1,8 @@
 {
   "cmd_start_welcome": "🤖 <b>Ingress Group Verification Bot</b>\n\nThis bot handles entry verification for Ingress-themed groups.\nNew members must pass image recognition verification to gain messaging permissions.\n\nUse /help to see available commands.",
+  "cmd_start_need_admin": "⚠️ I'm not a group administrator yet.\n\nPlease promote me with the <b>Restrict Members</b> and <b>Delete Messages</b> permissions, otherwise I can't verify new joiners.",
+  "cmd_start_missing_perms": "⚠️ I'm an administrator but missing some required permissions: <code>%s</code>.\n\nPlease grant them in the group admin settings, otherwise verification will not work.",
+  "cmd_group_command_advice": "💡 <b>Tip:</b> in groups, address me explicitly: <code>/start@%s</code>, <code>/help@%s</code>. Plain <code>/start</code> or <code>/help</code> without the @username is broadcast to every bot in the chat, so I'll stay silent in that case.",
 
   "cmd_help_title": "📖 <b>Available Commands</b>\n\n",
   "cmd_help_general": "<b>General Commands:</b>\n/start - Show welcome message\n/help - Show help information\n/myid - Get your Telegram User ID\n\n",
@@ -49,7 +52,7 @@
   "cache_missing_done": "✅ Cache backfill finished\nProcessed: %d\nSuccess: %d\nFailed: %d",
 
   "verify_welcome": "👋 Welcome %s!\n\nPlease complete verification within %d seconds.\nThe image shows %d pictures (labeled 1, 2, 3).\n\n<b>Please select the correct label for each picture in order.</b>\n\nCurrent: Select the label for picture <b>1</b>",
-  "verify_step_prompt": "👋 Verification in progress...\n\nSelected %d/%d\n\n<b>Select the label for picture %d</b>",
+  "verify_step_prompt": "👋 %s — verification in progress\n\nSelected %d/%d\n\n<b>Select the label for picture %d</b>",
   "verify_callback_selected": "Selected: %s",
   "verify_callback_not_yours": "This is not your verification!",
   "verify_callback_expired": "Verification has expired or does not exist",

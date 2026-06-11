@@ -28,6 +28,16 @@ type Config struct {
 	LeaderboardChannelID  int64
 	LeaderboardMessageID  int
 	DailyStatsTimezone    string
+	// AntispamBanBot is the username (no @) of an in-group anti-spam bot we
+	// delegate to when a tombstone fires. If non-empty, on tombstone hits we
+	// reply to the offending message with "/ban@<AntispamBanBot>" so that bot
+	// can act first; after a 2-second window we clean up our own command and
+	// fall back to our own delete+tempban. Set to "" to disable.
+	AntispamBanBot string
+	// VerifySilentNotifications mutes the in-group verification messages
+	// (challenge photo, regenerated photo, welcome on pass, admin moderation
+	// follow-ups). They still arrive in chat, just without sound/vibration.
+	VerifySilentNotifications bool
 }
 
 func Load() *Config {
@@ -42,11 +52,13 @@ func Load() *Config {
 		VerifyDistractorCount: getEnvInt("VERIFY_DISTRACTOR_COUNT", 3),
 		RejoinCooldownSeconds: getEnvInt("REJOIN_COOLDOWN_SECONDS", 300),
 		VerifyTempbanSeconds:  getEnvInt("VERIFY_TEMPBAN_SECONDS", 300),
-		DefaultLanguage:       getEnv("DEFAULT_LANGUAGE", "zh"),
+		DefaultLanguage:       getEnv("DEFAULT_LANGUAGE", "en"),
 		InitialAdminIDs:       getEnvInt64List("BOT_ADMIN_IDS"),
 		LeaderboardChannelID:  getEnvInt64("LEADERBOARD_CHANNEL_ID", 0),
 		LeaderboardMessageID:  getEnvInt("LEADERBOARD_MESSAGE_ID", 0),
 		DailyStatsTimezone:    getEnv("DAILY_STATS_TIMEZONE", "Asia/Shanghai"),
+		AntispamBanBot:            getEnv("ANTISPAM_BAN_BOT", "BadBustBot"),
+		VerifySilentNotifications: getEnvBool("VERIFY_SILENT_NOTIFICATIONS", true),
 	}
 }
 
@@ -95,6 +107,19 @@ func getEnvInt64(key string, defaultValue int64) int64 {
 			return intVal
 		}
 		log.Printf("Warning: invalid int64 value for %s: %s, using default %d", key, value, defaultValue)
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+		log.Printf("Warning: invalid bool value for %s: %s, using default %v", key, value, defaultValue)
 	}
 	return defaultValue
 }

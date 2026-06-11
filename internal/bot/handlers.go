@@ -81,35 +81,93 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 		log.Printf("[WARN] Tombstone check failed for user %d: %v", msg.From.ID, err)
 	} else if hasFailure {
 		var memberStatus string
+		var memberUntilDate int64
 		if member, mErr := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
 			ChatConfigWithUser: tgbotapi.ChatConfigWithUser{ChatID: msg.Chat.ID, UserID: msg.From.ID},
 		}); mErr != nil {
 			memberStatus = "<getChatMember error: " + mErr.Error() + ">"
 		} else {
 			memberStatus = member.Status
+			memberUntilDate = member.UntilDate
 		}
 		previewLen := 80
 		if len(msg.Text) < previewLen {
 			previewLen = len(msg.Text)
 		}
-		log.Printf("[WARN] Tombstone hit: msg from user %d in chat %d (status=%s) msg_id=%d date=%d text_preview=%q",
-			msg.From.ID, msg.Chat.ID, memberStatus, msg.MessageID, msg.Date, msg.Text[:previewLen])
+		log.Printf("[WARN] Tombstone hit: msg from user %d in chat %d (status=%s until=%d) msg_id=%d date=%d text_preview=%q",
+			msg.From.ID, msg.Chat.ID, memberStatus, memberUntilDate, msg.MessageID, msg.Date, msg.Text[:previewLen])
 
-		// Delete the offending message.
-		if _, dErr := b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)); dErr != nil {
-			log.Printf("[ERROR] Tombstone delete failed for msg %d: %v", msg.MessageID, dErr)
+		// Optional delegation to an in-group anti-spam bot. We can't pre-check
+		// whether the bot is a member (Telegram's getChatAdministrators excludes
+		// bots), so we send unconditionally and clean up our own command after
+		// 2s. If the bot is present it acts on its own /ban command; if absent
+		// the message is just litter that we delete ourselves.
+		var delegateMsgID int
+		delegated := false
+		if b.cfg.AntispamBanBot != "" {
+			delegateMsg := tgbotapi.NewMessage(msg.Chat.ID, "/ban@"+b.cfg.AntispamBanBot)
+			delegateMsg.ReplyToMessageID = msg.MessageID
+			delegateMsg.DisableNotification = true
+			if sent, sErr := b.api.Send(delegateMsg); sErr != nil {
+				log.Printf("[WARN] Tombstone /ban@%s send failed for chat %d: %v", b.cfg.AntispamBanBot, msg.Chat.ID, sErr)
+			} else {
+				delegated = true
+				delegateMsgID = sent.MessageID
+				log.Printf("[INFO] Tombstone delegated to @%s for user %d in chat %d (cmd msg %d)",
+					b.cfg.AntispamBanBot, msg.From.ID, msg.Chat.ID, delegateMsgID)
+			}
 		}
 
-		// Re-tempban to extend the window and clear any other queued scheduled
-		// messages. Idempotent — re-banning an already-banned user is a no-op.
-		tempbanUntil := time.Now().Add(time.Duration(b.cfg.VerifyTempbanSeconds) * time.Second).Unix()
-		if _, bErr := b.api.Request(tgbotapi.KickChatMemberConfig{
-			ChatMemberConfig: tgbotapi.ChatMemberConfig{ChatID: msg.Chat.ID, UserID: msg.From.ID},
-			UntilDate:        tempbanUntil,
-		}); bErr != nil {
-			log.Printf("[ERROR] Tombstone re-tempban failed for user %d: %v", msg.From.ID, bErr)
+		// If we delegated, give the anti-spam bot a 2-second head start before
+		// our own delete+tempban so it can ban/delete first. Re-fetch member
+		// status afterward — the bot may have just permanently banned the user.
+		if delegated {
+			time.Sleep(2 * time.Second)
+			if member, mErr := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+				ChatConfigWithUser: tgbotapi.ChatConfigWithUser{ChatID: msg.Chat.ID, UserID: msg.From.ID},
+			}); mErr == nil {
+				memberStatus = member.Status
+				memberUntilDate = member.UntilDate
+			}
+			// Clean up our own /ban command so groups without the anti-spam bot
+			// don't see lingering command litter. If the bot processed it,
+			// removing the trigger keeps the chat tidy too.
+			if _, dErr := b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, delegateMsgID)); dErr != nil {
+				log.Printf("[DEBUG] Tombstone delegate-cmd cleanup returned err (already gone?): %v", dErr)
+			}
+		}
+
+		// Delete the offending message. No-op if the anti-spam bot already did.
+		if _, dErr := b.api.Request(tgbotapi.NewDeleteMessage(msg.Chat.ID, msg.MessageID)); dErr != nil {
+			log.Printf("[DEBUG] Tombstone spam delete returned err (may be already gone): %v", dErr)
+		}
+
+		// Policy: a user with only a first-failure tempban who manages to land
+		// a message (almost always a pre-queued scheduled message firing from
+		// Telegram's side after their tempban started) has produced definitive
+		// spam evidence. Skip the second-chance retry and permanently ban
+		// them. Matches the second-failure cleanup in handleVerificationFailure.
+		if memberStatus == "kicked" && memberUntilDate == 0 {
+			log.Printf("[INFO] User %d already permanently banned in chat %d (anti-spam bot or prior path); clearing residual state", msg.From.ID, msg.Chat.ID)
 		} else {
-			log.Printf("[INFO] Tombstone re-tempbanned user %d until %d", msg.From.ID, tempbanUntil)
+			if _, bErr := b.api.Request(tgbotapi.KickChatMemberConfig{
+				ChatMemberConfig: tgbotapi.ChatMemberConfig{ChatID: msg.Chat.ID, UserID: msg.From.ID},
+				// UntilDate omitted → permanent ban.
+			}); bErr != nil {
+				log.Printf("[ERROR] Tombstone permanent ban failed for user %d: %v", msg.From.ID, bErr)
+			} else {
+				log.Printf("[INFO] Tombstone permanently banned user %d in chat %d (scheduled-message spam evidence)", msg.From.ID, msg.Chat.ID)
+			}
+		}
+
+		// Clear residual DB state to match the second-failure permanent-ban
+		// cleanup path: a permanent ban means the user is gone for good, so
+		// the failure row and join history shouldn't linger.
+		if err := b.db.ClearVerificationFailure(msg.Chat.ID, msg.From.ID); err != nil {
+			log.Printf("[ERROR] Tombstone: failed to clear failure record for user %d: %v", msg.From.ID, err)
+		}
+		if err := b.db.DeleteUserJoinHistory(msg.Chat.ID, msg.From.ID); err != nil {
+			log.Printf("[ERROR] Tombstone: failed to delete join history for user %d: %v", msg.From.ID, err)
 		}
 	}
 }
@@ -117,6 +175,15 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 	cmd := msg.Command()
 	args := msg.CommandArguments()
+
+	// In groups, /start and /help only respond when explicitly addressed to
+	// this bot (e.g., /start@ING_reCAPTCHA_bot). Plain /start is a wildcard
+	// that every bot in the group sees, and replying to it pollutes the chat.
+	if (cmd == "start" || cmd == "help") &&
+		(msg.Chat.Type == "group" || msg.Chat.Type == "supergroup") &&
+		!b.commandTargetsThisBot(msg) {
+		return
+	}
 
 	switch cmd {
 	case "start":
@@ -464,7 +531,25 @@ func (b *Bot) canManageBot(msg *tgbotapi.Message) bool {
 }
 
 func (b *Bot) checkBotPermissions(chatID int64) bool {
-	// Get bot's member status in the chat
+	status, missing, err := b.botPermissionStatus(chatID)
+	if err != nil {
+		return false
+	}
+	if status != "administrator" && status != "creator" {
+		log.Printf("[WARN] Bot is not an administrator in chat %d (status: %s)", chatID, status)
+		return false
+	}
+	if len(missing) > 0 {
+		log.Printf("[WARN] Bot lacks required permissions in chat %d: %v", chatID, missing)
+		return false
+	}
+	log.Printf("[DEBUG] Bot has all required permissions in chat %d", chatID)
+	return true
+}
+
+// botPermissionStatus returns the bot's chat-member status and any required
+// permissions it is missing. status == "" when the API call failed.
+func (b *Bot) botPermissionStatus(chatID int64) (status string, missing []string, err error) {
 	botMember, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
 		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
 			ChatID: chatID,
@@ -473,35 +558,31 @@ func (b *Bot) checkBotPermissions(chatID int64) bool {
 	})
 	if err != nil {
 		log.Printf("[ERROR] Failed to get bot member status: %v", err)
+		return "", nil, err
+	}
+	status = botMember.Status
+	if status != "administrator" && status != "creator" {
+		return status, nil, nil
+	}
+	if !botMember.CanRestrictMembers {
+		missing = append(missing, "can_restrict_members")
+	}
+	if !botMember.CanDeleteMessages {
+		missing = append(missing, "can_delete_messages")
+	}
+	return status, missing, nil
+}
+
+// commandTargetsThisBot reports whether the message's command was explicitly
+// addressed to this bot via the @username suffix (e.g. /start@ING_reCAPTCHA_bot).
+// A plain /start with no @ suffix is a group-wide broadcast and returns false.
+func (b *Bot) commandTargetsThisBot(msg *tgbotapi.Message) bool {
+	cmdWithAt := msg.CommandWithAt()
+	at := strings.IndexByte(cmdWithAt, '@')
+	if at < 0 {
 		return false
 	}
-
-	// Check if bot is admin
-	if botMember.Status != "administrator" && botMember.Status != "creator" {
-		log.Printf("[WARN] Bot is not an administrator in chat %d (status: %s)", chatID, botMember.Status)
-		return false
-	}
-
-	// Check required permissions
-	requiredPerms := map[string]bool{
-		"can_restrict_members": botMember.CanRestrictMembers,
-		"can_delete_messages":  botMember.CanDeleteMessages,
-	}
-
-	missingPerms := []string{}
-	for perm, has := range requiredPerms {
-		if !has {
-			missingPerms = append(missingPerms, perm)
-		}
-	}
-
-	if len(missingPerms) > 0 {
-		log.Printf("[WARN] Bot lacks required permissions in chat %d: %v", chatID, missingPerms)
-		return false
-	}
-
-	log.Printf("[DEBUG] Bot has all required permissions in chat %d", chatID)
-	return true
+	return strings.EqualFold(cmdWithAt[at+1:], b.self.UserName)
 }
 
 func escapeHTML(s string) string {

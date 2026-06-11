@@ -98,6 +98,7 @@ func (b *Bot) startVerificationInternal(chatID, userID int64, user *tgbotapi.Use
 	photo.Caption = caption
 	photo.ParseMode = "HTML"
 	photo.ReplyMarkup = keyboard
+	photo.DisableNotification = b.cfg.VerifySilentNotifications
 
 	sentMsg, err := b.api.Send(photo)
 	if err != nil {
@@ -525,7 +526,7 @@ func (b *Bot) handleAnswerCallback(query *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	caption := b.t(query.From, "verify_step_prompt", newStep, b.cfg.VerifyImageCount, newStep+1)
+	caption := b.t(query.From, "verify_step_prompt", formatUserMention(query.From), newStep, b.cfg.VerifyImageCount, newStep+1)
 
 	// Reconstruct option list from current keyboard, skipping the regenerate row (r:).
 	var options []string
@@ -635,6 +636,7 @@ func (b *Bot) handleRegenerateCallback(query *tgbotapi.CallbackQuery) {
 	photo.Caption = caption
 	photo.ParseMode = "HTML"
 	photo.ReplyMarkup = keyboard
+	photo.DisableNotification = b.cfg.VerifySilentNotifications
 
 	sentMsg, err := b.api.Send(photo)
 	if err != nil {
@@ -806,6 +808,7 @@ func (b *Bot) handleVerificationSuccess(query *tgbotapi.CallbackQuery, pv *datab
 	
 	welcomeMsg := tgbotapi.NewMessage(chatID, welcomeText)
 	welcomeMsg.ParseMode = "HTML"
+	welcomeMsg.DisableNotification = b.cfg.VerifySilentNotifications
 	if _, err := b.api.Send(welcomeMsg); err != nil {
 		log.Printf("[ERROR] Failed to send welcome message: %v", err)
 	}

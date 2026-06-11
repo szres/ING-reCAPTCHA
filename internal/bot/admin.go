@@ -10,7 +10,7 @@ import (
 func (b *Bot) cmdStart(msg *tgbotapi.Message, args string) {
 	// Handle deep links like /start test or /start retry_test
 	args = strings.TrimSpace(args)
-	
+
 	if args == "test" || args == "retry_test" {
 		// Only allow in private chat
 		if msg.Chat.Type == "private" {
@@ -20,8 +20,32 @@ func (b *Bot) cmdStart(msg *tgbotapi.Message, args string) {
 			return
 		}
 	}
-	
-	// Default welcome message
+
+	// In groups, /start is a setup probe. Check our own permissions so the
+	// group admin gets actionable feedback instead of a silent failure when
+	// the first user joins. Every group reply also gets the usage tip
+	// reminding admins to address commands with @username so other bots
+	// don't pick them up.
+	if msg.Chat.Type == "group" || msg.Chat.Type == "supergroup" {
+		advice := b.t(msg.From, "cmd_group_command_advice", b.self.UserName, b.self.UserName)
+		status, missing, err := b.botPermissionStatus(msg.Chat.ID)
+		if err == nil {
+			if status != "administrator" && status != "creator" {
+				b.sendMessage(msg.Chat.ID, b.t(msg.From, "cmd_start_need_admin")+"\n\n"+advice)
+				return
+			}
+			if len(missing) > 0 {
+				b.sendMessage(msg.Chat.ID, b.t(msg.From, "cmd_start_missing_perms", strings.Join(missing, ", "))+"\n\n"+advice)
+				return
+			}
+		}
+		reply := tgbotapi.NewMessage(msg.Chat.ID, b.t(msg.From, "cmd_start_welcome")+"\n\n"+advice)
+		reply.ParseMode = "HTML"
+		b.api.Send(reply)
+		return
+	}
+
+	// Default welcome message (private chat)
 	reply := tgbotapi.NewMessage(msg.Chat.ID, b.t(msg.From, "cmd_start_welcome"))
 	reply.ParseMode = "HTML"
 	b.api.Send(reply)
@@ -41,6 +65,11 @@ func (b *Bot) cmdHelp(msg *tgbotapi.Message) {
 	sb.WriteString(b.t(msg.From, "cmd_help_permissions"))
 	sb.WriteString("\n\n")
 	sb.WriteString(b.t(msg.From, "cmd_help_i18n"))
+
+	if msg.Chat.Type == "group" || msg.Chat.Type == "supergroup" {
+		sb.WriteString("\n\n")
+		sb.WriteString(b.t(msg.From, "cmd_group_command_advice", b.self.UserName, b.self.UserName))
+	}
 
 	reply := tgbotapi.NewMessage(msg.Chat.ID, sb.String())
 	reply.ParseMode = "HTML"
