@@ -175,7 +175,7 @@ func TestEvaluateVerification(t *testing.T) {
 		t.Helper()
 		b, mock := newTestBot(t)
 		// VerifyRequiredCorrect is 2 (set in newTestBot)
-		err := b.db.CreatePendingVerification(chatID, userID, correctLabels, time.Now().Add(time.Minute), false, "en")
+		err := b.db.CreatePendingVerification(chatID, userID, correctLabels, time.Now().Add(time.Minute), false, "en", nil)
 		require.NoError(t, err)
 		return b, mock
 	}
@@ -284,7 +284,7 @@ func TestHandleVerificationFailure_KickError_DoesNotRecordFailure(t *testing.T) 
 		userID int64 = 100
 	)
 
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 	pv, err := b.db.GetPendingVerification(chatID, userID)
 	require.NoError(t, err)
 	require.NotNil(t, pv)

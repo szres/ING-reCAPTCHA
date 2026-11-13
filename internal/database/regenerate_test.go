@@ -12,7 +12,7 @@ func TestRegenerateVerification_SwapsChallengeAndBumpsVersion(t *testing.T) {
 	db := newTestDB(t)
 	const chatID, userID int64 = 1, 1
 	expiresAt := time.Now().Add(time.Minute).Truncate(time.Second)
-	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"cat", "dog"}, expiresAt, false, "en"))
+	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"cat", "dog"}, expiresAt, false, "en", nil))
 
 	pv, err := db.GetPendingVerification(chatID, userID)
 	require.NoError(t, err)
@@ -21,7 +21,7 @@ func TestRegenerateVerification_SwapsChallengeAndBumpsVersion(t *testing.T) {
 	assert.False(t, pv.Regenerated)
 
 	newExpires := time.Now().Add(2 * time.Minute).Truncate(time.Second)
-	ok, err := db.RegenerateVerification(chatID, userID, []string{"bird", "fish"}, newExpires)
+	ok, err := db.RegenerateVerification(chatID, userID, []string{"bird", "fish"}, newExpires, nil)
 	require.NoError(t, err)
 	require.True(t, ok)
 
@@ -40,14 +40,14 @@ func TestRegenerateVerification_SwapsChallengeAndBumpsVersion(t *testing.T) {
 func TestRegenerateVerification_RefusesSecondTime(t *testing.T) {
 	db := newTestDB(t)
 	const chatID, userID int64 = 1, 1
-	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 
-	ok, err := db.RegenerateVerification(chatID, userID, []string{"dog"}, time.Now().Add(time.Minute))
+	ok, err := db.RegenerateVerification(chatID, userID, []string{"dog"}, time.Now().Add(time.Minute), nil)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	// Second call must be refused — regenerated=1 now.
-	ok, err = db.RegenerateVerification(chatID, userID, []string{"bird"}, time.Now().Add(time.Minute))
+	ok, err = db.RegenerateVerification(chatID, userID, []string{"bird"}, time.Now().Add(time.Minute), nil)
 	require.NoError(t, err)
 	assert.False(t, ok)
 
@@ -59,7 +59,7 @@ func TestRegenerateVerification_RefusesSecondTime(t *testing.T) {
 
 func TestRegenerateVerification_NoopOnMissingRow(t *testing.T) {
 	db := newTestDB(t)
-	ok, err := db.RegenerateVerification(999, 999, []string{"x"}, time.Now().Add(time.Minute))
+	ok, err := db.RegenerateVerification(999, 999, []string{"x"}, time.Now().Add(time.Minute), nil)
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -67,14 +67,14 @@ func TestRegenerateVerification_NoopOnMissingRow(t *testing.T) {
 func TestCreatePendingVerification_ResetsRegenerateState(t *testing.T) {
 	db := newTestDB(t)
 	const chatID, userID int64 = 1, 1
-	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"a"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"a"}, time.Now().Add(time.Minute), false, "en", nil))
 
-	ok, err := db.RegenerateVerification(chatID, userID, []string{"b"}, time.Now().Add(time.Minute))
+	ok, err := db.RegenerateVerification(chatID, userID, []string{"b"}, time.Now().Add(time.Minute), nil)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	// Fresh session via the upsert path: regenerated and challenge_version must reset to 0.
-	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"c"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"c"}, time.Now().Add(time.Minute), false, "en", nil))
 
 	pv, err := db.GetPendingVerification(chatID, userID)
 	require.NoError(t, err)
@@ -86,20 +86,20 @@ func TestCreatePendingVerification_ResetsRegenerateState(t *testing.T) {
 func TestUpdateVerificationStep_RejectsStaleVersion(t *testing.T) {
 	db := newTestDB(t)
 	const chatID, userID int64 = 1, 1
-	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"a", "b"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, db.CreatePendingVerification(chatID, userID, []string{"a", "b"}, time.Now().Add(time.Minute), false, "en", nil))
 
 	// Bump version via regenerate.
-	ok, err := db.RegenerateVerification(chatID, userID, []string{"c", "d"}, time.Now().Add(time.Minute))
+	ok, err := db.RegenerateVerification(chatID, userID, []string{"c", "d"}, time.Now().Add(time.Minute), nil)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	// A late-arriving callback tries to advance using the OLD version (0).
-	ok, err = db.UpdateVerificationStep(chatID, userID, 1, []string{"stale"}, 0)
+	ok, err = db.UpdateVerificationStep(chatID, userID, 0, 1, []string{"stale"}, 0)
 	require.NoError(t, err)
 	assert.False(t, ok, "stale-version update must not apply")
 
 	// New version (1) succeeds.
-	ok, err = db.UpdateVerificationStep(chatID, userID, 1, []string{"fresh"}, 1)
+	ok, err = db.UpdateVerificationStep(chatID, userID, 0, 1, []string{"fresh"}, 1)
 	require.NoError(t, err)
 	assert.True(t, ok)
 

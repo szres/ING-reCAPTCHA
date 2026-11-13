@@ -31,6 +31,7 @@ func TestMigrate_CreatesAllTables(t *testing.T) {
 		"image_sets", "images", "pending_verifications",
 		"admins", "user_join_history", "verification_failures",
 		"user_language_preferences", "image_set_labels",
+		"verified_users", "scheduled_message_deletions",
 	}
 	for _, table := range tables {
 		ok, err := db.HasTable(table)

@@ -76,6 +76,14 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 	// tempban, a silently-rejoined member whose chat_member update was
 	// dropped, or a Telegram delivery race. Delete + re-tempban, and log
 	// enough state to disambiguate after the fact.
+	//
+	// Kill-switch: groups running in Join Request mode never accumulate
+	// verification_failures rows through the pre-join flow, and the ones
+	// they carry from earlier legacy-flow tests can misfire on admins.
+	// ANTISPAM_TOMBSTONE_ENABLED=false skips the filter entirely.
+	if !b.cfg.AntispamTombstoneEnabled {
+		return
+	}
 	hasFailure, err := b.db.HasPreviousFailure(msg.Chat.ID, msg.From.ID)
 	if err != nil {
 		log.Printf("[WARN] Tombstone check failed for user %d: %v", msg.From.ID, err)
@@ -176,10 +184,20 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 	cmd := msg.Command()
 	args := msg.CommandArguments()
 
-	// In groups, /start and /help only respond when explicitly addressed to
-	// this bot (e.g., /start@ING_reCAPTCHA_bot). Plain /start is a wildcard
-	// that every bot in the group sees, and replying to it pollutes the chat.
-	if (cmd == "start" || cmd == "help") &&
+	// In groups, generic-name commands only respond when explicitly addressed
+	// to this bot (e.g., /start@ING_reCAPTCHA_bot). Plain /start is a
+	// wildcard that every bot in the group sees, and replying to it pollutes
+	// the chat. /joinpolicy is also on this list because admins of groups
+	// that host multiple anti-spam bots will type the bare name out of habit
+	// and we don't want it interpreted by us when they meant someone else.
+	// Bare /start, /help, /joinpolicy in groups are wildcard-shaped: they
+	// exist on every bot and typing them without an @bot suffix pollutes
+	// multi-bot chats. /setting is per-bot config by nature and admin-only,
+	// so the collision risk is low — bare /setting in a group is treated
+	// as intent to configure THIS bot. That matches operator muscle memory
+	// (they just typed /setting@bot a moment ago; typing @bot on every
+	// follow-up is friction).
+	if (cmd == "start" || cmd == "help" || cmd == "joinpolicy") &&
 		(msg.Chat.Type == "group" || msg.Chat.Type == "supergroup") &&
 		!b.commandTargetsThisBot(msg) {
 		return
@@ -220,6 +238,12 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.cmdDelLabel(msg, args)
 	case "cachemissing":
 		b.cmdCacheMissing(msg, args)
+	case "joinpolicy":
+		b.cmdJoinPolicy(msg, args)
+	case "setting", "settings":
+		b.cmdSetting(msg, args)
+	case "setup":
+		b.cmdSetup(msg, args)
 	}
 }
 
@@ -264,6 +288,40 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 	}
 
 	log.Printf("[INFO] New member joined: user %d in chat %d", userID, chatID)
+
+	// Mini App dual-flow race guard.
+	//
+	// When the Mini App approves a user via answerChatJoinRequestQuery,
+	// Telegram delivers a chat_member 'left → member' transition right
+	// after admitting them. Without this guard the bot would interpret
+	// that transition as a fresh join and start a SECOND captcha on top
+	// of the user we already approved.
+	//
+	// HasRecentMiniAppApproval looks up approved_prejoin sessions within
+	// the past 5 minutes (matches the Mini App session TTL). If found,
+	// skip the in-group flow entirely — the user already proved they're
+	// human and the silent welcome message (if enabled) was sent from
+	// the Mini App's approve path.
+	if b.cfg.MiniAppEnabled {
+		approved, err := b.db.HasRecentMiniAppApproval(chatID, userID, b.cfg.MiniAppSessionTTLSeconds)
+		if err != nil {
+			log.Printf("[ERROR] check mini app approval for user %d in chat %d: %v", userID, chatID, err)
+		} else if approved {
+			log.Printf("[INFO] Skipping in-group verification for user %d in chat %d — recently approved via Mini App", userID, chatID)
+			return
+		}
+	}
+
+	if b.isVerifiedUser(userID) {
+		// A strike left over from an earlier failed attempt in this chat
+		// would otherwise make the tombstone filter ban them on their first
+		// message, now that no captcha is going to clear it.
+		if err := b.db.ClearVerificationFailure(chatID, userID); err != nil {
+			log.Printf("[ERROR] Failed to clear failure record for verified user %d in chat %d: %v", userID, chatID, err)
+		}
+		log.Printf("[INFO] Skipping verification for user %d in chat %d — already verified in another chat", userID, chatID)
+		return
+	}
 
 	// Check bot permissions in this chat
 	if !b.checkBotPermissions(chatID) {
@@ -335,6 +393,19 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 	}
 }
 
+// isVerifiedUser reports whether the user is on the global pass list — they
+// solved a captcha themselves in some chat, or an operator imported them —
+// and so joins every chat without another one. If the lookup fails the user
+// is verified as usual: an unnecessary captcha is the safe mistake.
+func (b *Bot) isVerifiedUser(userID int64) bool {
+	verified, err := b.db.IsUserVerified(userID)
+	if err != nil {
+		log.Printf("[ERROR] Pass list lookup failed for user %d, verifying as usual: %v", userID, err)
+		return false
+	}
+	return verified
+}
+
 func (b *Bot) cleanupVerificationState(chatID, userID int64) {
 	key := fmt.Sprintf("%d:%d", chatID, userID)
 
@@ -357,30 +428,24 @@ func (b *Bot) cleanupVerificationState(chatID, userID int64) {
 		return
 	}
 
-	// If verification message hasn't been sent yet (MessageID is NULL),
-	// schedule a delayed cleanup to catch it after it's sent
-	if !pv.MessageID.Valid {
+	// Ephemeral verifications set EphemeralMessageID (MessageID stays
+	// NULL) — route them through the shared helper so admin
+	// broadcasts get cleaned up in the same call. Regular verifications
+	// with MessageID set take the same helper. Only the "message not
+	// yet sent at all" case (neither ID present) falls to the delayed
+	// cleanup, because the send is still in-flight.
+	if pv.EphemeralMessageID != 0 || pv.MessageID.Valid {
+		b.deleteVerificationMessageFor(pv, "member-left")
+		if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
+			log.Printf("[WARN] Failed to delete pending verification for user %d: %v", userID, err)
+		}
+	} else {
 		log.Printf("[DEBUG] Verification message not yet sent for user %d, scheduling delayed cleanup", userID)
 		go func() {
 			time.Sleep(10 * time.Second)
 			b.cleanupVerificationMessageDelayed(chatID, userID)
 		}()
 		// Don't delete pending verification yet - let delayed cleanup handle it
-	} else {
-		// Delete verification message immediately
-		messageID := int(pv.MessageID.Int64)
-		log.Printf("[DEBUG] Deleting verification message %d for removed user %d", messageID, userID)
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-		if _, err := b.api.Request(deleteMsg); err != nil {
-			log.Printf("[WARN] Failed to delete verification message %d: %v", messageID, err)
-		} else {
-			log.Printf("[DEBUG] Successfully deleted verification message %d", messageID)
-		}
-
-		// Clean up database records immediately
-		if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
-			log.Printf("[WARN] Failed to delete pending verification for user %d: %v", userID, err)
-		}
 	}
 
 	// Delete join message if exists (prefer DB, fallback to cache)
@@ -427,25 +492,18 @@ func (b *Bot) cleanupVerificationMessageDelayed(chatID, userID int64) {
 		return
 	}
 
-	// If message ID is still not set, give up (message send probably failed)
-	if !pv.MessageID.Valid {
+	// If neither ID is set, give up (message send probably failed).
+	if !pv.MessageID.Valid && pv.EphemeralMessageID == 0 {
 		log.Printf("[DEBUG] Delayed cleanup: verification message still not sent for user %d after delay, giving up", userID)
-		// Clean up the pending verification anyway
 		if err := b.db.DeletePendingVerification(chatID, userID); err != nil {
 			log.Printf("[WARN] Delayed cleanup: failed to delete pending verification for user %d: %v", userID, err)
 		}
 		return
 	}
 
-	// Delete the verification message
-	messageID := int(pv.MessageID.Int64)
-	log.Printf("[DEBUG] Delayed cleanup: deleting verification message %d for user %d", messageID, userID)
-	deleteMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
-	if _, err := b.api.Request(deleteMsg); err != nil {
-		log.Printf("[WARN] Delayed cleanup: failed to delete verification message %d: %v", messageID, err)
-	} else {
-		log.Printf("[DEBUG] Delayed cleanup: successfully deleted verification message %d", messageID)
-	}
+	// Route through the shared helper — handles both regular and
+	// ephemeral (plus any admin ephemeral broadcasts) uniformly.
+	b.deleteVerificationMessageFor(pv, "delayed-cleanup")
 
 	// Clean up pending verification
 	if err := b.db.DeletePendingVerification(chatID, userID); err != nil {

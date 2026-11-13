@@ -28,7 +28,7 @@ func TestHandleMessage_JoinServiceMessage(t *testing.T) {
 	)
 
 	// Create a pending verification so UpdateJoinMessageID has a record to update
-	require.NoError(t, b.db.CreatePendingVerification(chatID, memberID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, memberID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 
 	msg := groupMsg(chatID, 0, msgID)
 	msg.NewChatMembers = []tgbotapi.User{{ID: memberID, FirstName: "Alice"}}
@@ -71,7 +71,7 @@ func TestHandleMessage_PendingUser_DeletesMessage(t *testing.T) {
 		chatID int64 = 100
 		userID int64 = 200
 	)
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 
 	b.handleMessage(groupMsg(chatID, userID, 55))
 
@@ -128,7 +128,7 @@ func TestHandleChatMemberUpdate_UserRemoved_CleansVerificationState(t *testing.T
 		joinMsgID         int   = 1000
 	)
 
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 	require.NoError(t, b.db.UpdateVerificationMessageID(chatID, userID, verificationMsgID))
 	require.NoError(t, b.db.UpdateJoinMessageID(chatID, userID, joinMsgID))
 	require.NoError(t, b.db.RecordUserJoin(chatID, userID))
@@ -171,7 +171,7 @@ func TestCleanupVerificationState_OnlyCacheHasJoinMsgID(t *testing.T) {
 	)
 
 	// Create pending verification but don't set join_message_id in DB
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 	require.NoError(t, b.db.UpdateVerificationMessageID(chatID, userID, verificationMsgID))
 	// Only cache has join message ID
 	b.joinMsgCache.Store(fmt.Sprintf("%d:%d", chatID, userID), joinMsgID)
@@ -193,7 +193,7 @@ func TestCleanupVerificationState_DeleteMessageFailure_StillCleansDB(t *testing.
 		verificationMsgID int   = 1001
 	)
 
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 	require.NoError(t, b.db.UpdateVerificationMessageID(chatID, userID, verificationMsgID))
 
 	// Simulate message deletion failure
@@ -240,7 +240,7 @@ func TestCleanupVerificationState_MessageNotYetSent_SchedulesDelayedCleanup(t *t
 	)
 
 	// Create pending verification without message ID (simulating message still being sent)
-	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en"))
+	require.NoError(t, b.db.CreatePendingVerification(chatID, userID, []string{"cat"}, time.Now().Add(time.Minute), false, "en", nil))
 
 	// Verify message ID is not set
 	pv, err := b.db.GetPendingVerification(chatID, userID)
@@ -260,8 +260,11 @@ func TestCleanupVerificationState_MessageNotYetSent_SchedulesDelayedCleanup(t *t
 	// Wait for delayed cleanup to execute
 	time.Sleep(11 * time.Second)
 
-	// Verify delayed cleanup deleted the message
-	assert.True(t, mock.deleteMessageCalled, "delayed cleanup should delete verification message")
-	assert.Contains(t, mock.deletedMessages, verificationMsgID, "should delete verification message")
+	// Verify delayed cleanup deleted the message. It ran on a background
+	// goroutine that writes the mock under its lock, so read under it too.
+	mock.mu.Lock()
+	deleteCalled, deleted := mock.deleteMessageCalled, append([]int(nil), mock.deletedMessages...)
+	mock.mu.Unlock()
+	assert.True(t, deleteCalled, "delayed cleanup should delete verification message")
+	assert.Contains(t, deleted, verificationMsgID, "should delete verification message")
 }
-

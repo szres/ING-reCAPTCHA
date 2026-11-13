@@ -34,10 +34,76 @@ type Config struct {
 	// can act first; after a 2-second window we clean up our own command and
 	// fall back to our own delete+tempban. Set to "" to disable.
 	AntispamBanBot string
+	// AntispamTombstoneEnabled turns the scheduled-message tombstone filter
+	// on/off globally. When false, handleMessage skips the tombstone check
+	// entirely — no ban, no delete, no delegation. Intended for groups that
+	// run in Join Request mode where the pre-join Mini App flow makes the
+	// tombstone unnecessary (users can't post scheduled messages before
+	// they're admitted, and the DB's verification_failures rows are only
+	// populated by the legacy in-group flow so the tombstone would only
+	// misfire on already-admitted admins with stale rows). Defaults to
+	// true to preserve legacy-flow behaviour.
+	AntispamTombstoneEnabled bool
 	// VerifySilentNotifications mutes the in-group verification messages
 	// (challenge photo, regenerated photo, welcome on pass, admin moderation
 	// follow-ups). They still arrive in chat, just without sound/vibration.
 	VerifySilentNotifications bool
+	// EphemeralVerifyEnabled sends the in-group verification challenge as
+	// a Bot API 10.2 Ephemeral Message — visible only to the joining user
+	// (and the bot). Eliminates group spam and shoulder-surfing of the
+	// captcha. Only applies to the legacy in-group chat_member flow;
+	// the Mini App / chat_join_request flow already runs pre-join and
+	// doesn't need this. Requires the bot to be on Bot API 10.2+ (July
+	// 2026). Defaults to false while ephemeral rollout stabilises.
+	EphemeralVerifyEnabled bool
+	// EphemeralFallbackSeconds is how long an ephemeral challenge may sit
+	// without a single tap before it is re-sent as a regular group message.
+	// Telegram does not guarantee delivery of ephemeral messages, least of
+	// all to a user who is offline when they are admitted, and an undelivered
+	// challenge would otherwise run out as a timeout and a ban. 0 disables
+	// the fallback. Set via EPHEMERAL_FALLBACK_SECONDS; values at or above
+	// VERIFY_TIMEOUT_SECONDS never trigger.
+	EphemeralFallbackSeconds int
+
+	// Mini App verification (chat_join_request flow).
+	//
+	// MiniAppEnabled turns the entire pre-join Mini App flow on/off. When
+	// false the bot ignores chat_join_request updates and the HTTP server
+	// is not started. The existing in-group chat_member flow keeps working
+	// unchanged either way.
+	MiniAppEnabled bool
+	// MiniAppListenAddr is the TCP address the internal HTTP server binds
+	// to (e.g. ":8080"). Cloudflare Tunnel terminates TLS at the edge and
+	// forwards plain HTTP to this address; we never expose it directly.
+	MiniAppListenAddr string
+	// MiniAppPublicURL is the externally-reachable HTTPS origin the Mini
+	// App is served from, with no trailing slash (e.g.
+	// "https://verify.szres.org"). Sent to Telegram as the web_app_url
+	// argument to sendChatJoinRequestWebApp.
+	MiniAppPublicURL string
+	// MiniAppSessionTTLSeconds is the lifetime of a Mini App verification
+	// session. Codex's review flagged the original 90s as too tight for a
+	// real user on a slow mobile network; default 300s (5 minutes), matching
+	// Telegram's documented chat_join_request window.
+	MiniAppSessionTTLSeconds int
+	// WelcomeMessageInGroup controls whether we send a (silent) welcome
+	// message in the group after a Mini App pass + chat_join_request
+	// approval. The welcome message is the only in-group artifact of the
+	// Mini App flow; everything else happens silently before the user
+	// even joins.
+	WelcomeMessageInGroup bool
+
+	// FailNotifyChatIDs restricts the failure-notification hook to a
+	// specific set of group chats — DMs are only sent for verification
+	// failures / timeouts that occurred in one of these chats. Empty
+	// disables the feature. Set via FAIL_NOTIFY_CHAT_IDS (comma-separated
+	// list of chat_ids, negative for supergroups).
+	FailNotifyChatIDs []int64
+	// FailNotifyUserIDs receives the DM when a failure/timeout fires in
+	// a chat listed in FailNotifyChatIDs. Set via FAIL_NOTIFY_USER_IDS
+	// (comma-separated user_ids). The DM includes the applicant's
+	// username and user_id so an admin can eyeball spam patterns.
+	FailNotifyUserIDs []int64
 }
 
 func Load() *Config {
@@ -58,7 +124,19 @@ func Load() *Config {
 		LeaderboardMessageID:  getEnvInt("LEADERBOARD_MESSAGE_ID", 0),
 		DailyStatsTimezone:    getEnv("DAILY_STATS_TIMEZONE", "Asia/Shanghai"),
 		AntispamBanBot:            getEnv("ANTISPAM_BAN_BOT", "BadBustBot"),
+		AntispamTombstoneEnabled:  getEnvBool("ANTISPAM_TOMBSTONE_ENABLED", true),
 		VerifySilentNotifications: getEnvBool("VERIFY_SILENT_NOTIFICATIONS", true),
+		EphemeralVerifyEnabled:    getEnvBool("EPHEMERAL_VERIFY_ENABLED", false),
+		EphemeralFallbackSeconds:  getEnvInt("EPHEMERAL_FALLBACK_SECONDS", 30),
+
+		MiniAppEnabled:           getEnvBool("MINIAPP_ENABLED", false),
+		MiniAppListenAddr:        getEnv("MINIAPP_LISTEN_ADDR", ":8080"),
+		MiniAppPublicURL:         strings.TrimRight(getEnv("MINIAPP_PUBLIC_URL", ""), "/"),
+		MiniAppSessionTTLSeconds: getEnvInt("MINIAPP_SESSION_TTL_SECONDS", 300),
+		WelcomeMessageInGroup:    getEnvBool("WELCOME_MESSAGE_IN_GROUP", true),
+
+		FailNotifyChatIDs: getEnvInt64List("FAIL_NOTIFY_CHAT_IDS"),
+		FailNotifyUserIDs: getEnvInt64List("FAIL_NOTIFY_USER_IDS"),
 	}
 }
 

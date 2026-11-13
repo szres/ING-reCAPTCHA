@@ -1,0 +1,135 @@
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --text: var(--tg-theme-text-color, #111111);
+  --hint: var(--tg-theme-hint-color, #707579);
+  --link: var(--tg-theme-link-color, #2481cc);
+  --button: var(--tg-theme-button-color, #2481cc);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --secondary-bg: var(--tg-theme-secondary-bg-color, #f1f1f1);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+* { box-sizing: border-box; }
+
+/* The HTML `hidden` attribute normally maps to `display: none`, but any
+   explicit `display` rule on the element (e.g. `.state { display: flex }`)
+   wins by CSS specificity, leaving all states stacked on screen. Force
+   `[hidden]` back to none. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+#app {
+  min-height: 100dvh;
+  padding:
+    calc(16px + var(--safe-top))
+    calc(16px + var(--safe-right))
+    calc(16px + var(--safe-bottom))
+    calc(16px + var(--safe-left));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.brand { font-weight: 600; }
+.progress { color: var(--hint); font-variant-numeric: tabular-nums; font-size: 14px; }
+
+.progressbar {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--secondary-bg);
+  overflow: hidden;
+}
+
+.progressbar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: var(--button);
+  border-radius: inherit;
+  transition: width 240ms ease-out;
+}
+
+.challenge { display: flex; flex-direction: column; gap: 12px; }
+
+.prompt {
+  margin: 0;
+  font-size: 15px;
+  color: var(--hint);
+}
+
+.image-wrap {
+  background: var(--secondary-bg);
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+}
+
+#challenge-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 60dvh;
+  object-fit: contain;
+}
+
+.options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.options button {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  padding: 14px 12px;
+  border-radius: 10px;
+  background: var(--secondary-bg);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  text-align: center;
+  min-height: 48px;
+  transition: transform 0.05s ease;
+}
+.options button:active { transform: scale(0.97); }
+.options button.primary {
+  background: var(--button);
+  color: var(--button-text);
+}
+.options button[disabled] { opacity: 0.5; cursor: default; }
+
+.state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 8px;
+  padding: 24px 8px;
+  color: var(--hint);
+}
+.state h2 { margin: 0; color: var(--text); }

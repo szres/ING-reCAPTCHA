@@ -20,6 +20,7 @@ type mockTelegramAPI struct {
 	deleteMessageCalled bool
 	chatMemberFn       func(tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error)
 	sendErr            error
+	sentMessageID      int
 	requestErr         error
 }
 
@@ -27,7 +28,7 @@ func (m *mockTelegramAPI) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sent = append(m.sent, c)
-	return tgbotapi.Message{}, m.sendErr
+	return tgbotapi.Message{MessageID: m.sentMessageID}, m.sendErr
 }
 
 func (m *mockTelegramAPI) Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, error) {
@@ -44,11 +45,19 @@ func (m *mockTelegramAPI) Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, 
 	return &tgbotapi.APIResponse{Ok: true}, m.requestErr
 }
 
+func (m *mockTelegramAPI) GetChat(cfg tgbotapi.ChatInfoConfig) (tgbotapi.Chat, error) {
+	return tgbotapi.Chat{ID: cfg.ChatID, Title: "mock-chat"}, nil
+}
+
 func (m *mockTelegramAPI) GetChatMember(cfg tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error) {
 	if m.chatMemberFn != nil {
 		return m.chatMemberFn(cfg)
 	}
 	return tgbotapi.ChatMember{Status: "member"}, nil
+}
+
+func (m *mockTelegramAPI) GetChatAdministrators(cfg tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error) {
+	return nil, nil
 }
 
 func (m *mockTelegramAPI) GetFile(cfg tgbotapi.FileConfig) (tgbotapi.File, error) {

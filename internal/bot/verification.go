@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -41,16 +42,8 @@ func (b *Bot) startVerificationInternal(chatID, userID int64, user *tgbotapi.Use
 		log.Printf("[WARN] Failed to check existing verification: %v", err)
 	}
 
-	if existingPV != nil && existingPV.MessageID.Valid {
-		oldMessageID := int(existingPV.MessageID.Int64)
-		log.Printf("[DEBUG] Found existing verification, deleting old message %d", oldMessageID)
-
-		// Delete old message to avoid confusion
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, oldMessageID)
-		if _, err := b.api.Request(deleteMsg); err != nil {
-			// Ignore "message not found" errors (user may have deleted it)
-			log.Printf("[DEBUG] Failed to delete old verification message (may already be deleted): %v", err)
-		}
+	if existingPV != nil {
+		b.deleteVerificationMessageFor(existingPV, "restart-cleanup")
 	}
 
 	// Pre-flight: enough image sets? In production, auto-approve on shortage; in test, fail.
@@ -77,14 +70,22 @@ func (b *Bot) startVerificationInternal(chatID, userID int64, user *tgbotapi.Use
 	// Create pending verification record (starts at challenge_version=0, regenerated=0)
 	expiresAt := time.Now().Add(time.Duration(b.cfg.VerifyTimeoutSeconds) * time.Second)
 	log.Printf("[DEBUG] Creating pending verification, expires at: %v", expiresAt)
-	if err := b.db.CreatePendingVerification(chatID, userID, correctLabels, expiresAt, isTest, userLang); err != nil {
+	if err := b.db.CreatePendingVerification(chatID, userID, correctLabels, expiresAt, isTest, userLang, allOptions); err != nil {
 		return fmt.Errorf("failed to create pending verification: %w", err)
 	}
 
+	// Resolve per-chat overrides layered over the global config. Shared
+	// with /setting and /setup so displayed config always matches
+	// behaviour. A read error degrades to config defaults rather than
+	// failing the join.
+	ephemeralMode, adminVisible := b.chooseChallengeMode(chatID, userID, isTest)
+
 	// Group chats get admin moderation controls (Approve / Ban). Test verifications
 	// run in private chat (or via /test in a group by a bot admin) and never need
-	// them — they're not real entries.
-	showAdminControls := chatID < 0 && !isTest
+	// them — they're not real entries. Ephemeral mode also hides them: they
+	// live on the ephemeral message that only the target user sees, so admins
+	// have no way to tap them anyway.
+	showAdminControls := chatID < 0 && !isTest && !ephemeralMode
 	keyboard := b.buildVerificationKeyboard(userID, 0, 0, allOptions, userLang, true, showAdminControls)
 
 	caption := b.t(user, "verify_welcome",
@@ -94,6 +95,62 @@ func (b *Bot) startVerificationInternal(chatID, userID int64, user *tgbotapi.Use
 	)
 
 	log.Printf("[DEBUG] Sending verification message to chat %d", chatID)
+
+	// Ephemeral path (Bot API 10.2): send the challenge as a message
+	// visible only to the joining user + the bot. No other group member
+	// sees the captcha photo or keyboard — kills group spam and
+	// shoulder-surfing in one go. Only applies to real group joins;
+	// /test in DM or bot-admin test paths continue with the regular
+	// send so admins can eyeball the challenge for QA.
+	if ephemeralMode {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		result, sendErr := b.sendPhotoEphemeral(
+			ctx, chatID, userID,
+			composedPath, caption, keyboard, b.cfg.VerifySilentNotifications,
+		)
+		if sendErr != nil {
+			// If Telegram doesn't yet support Bot API 10.2 on this chat/
+			// account (e.g. rollout gap), fall through to the standard
+			// public send below so verification still functions. Log so
+			// operators can flip the env off if it happens too often.
+			log.Printf("[WARN] ephemeral verify send failed for chat=%d user=%d, falling back to public send: %v",
+				chatID, userID, sendErr)
+		} else {
+			log.Printf("[DEBUG] Ephemeral verification message sent, ephemeral_message_id: %d", result.EphemeralMessageID)
+			// Persist the ephemeral ID BEFORE broadcasting to admins.
+			// If this DB write fails we can't reliably cleanup on
+			// success/fail/timeout — better to nuke the just-sent
+			// ephemeral and abort so verification isn't stranded in a
+			// state cleanup can't reach.
+			if err := b.db.UpdateVerificationEphemeralMessageID(chatID, userID, result.EphemeralMessageID); err != nil {
+				log.Printf("[ERROR] Failed to persist ephemeral message ID (chat=%d user=%d eid=%d), rolling back: %v",
+					chatID, userID, result.EphemeralMessageID, err)
+				delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if delErr := b.deleteEphemeralMessage(delCtx, chatID, userID, result.EphemeralMessageID); delErr != nil {
+					log.Printf("[WARN] rollback deleteEphemeralMessage after persist fail: %v", delErr)
+				}
+				delCancel()
+				return fmt.Errorf("persist ephemeral message id: %w", err)
+			}
+			// Record whether we'll broadcast to admins so regenerate
+			// and cleanup honor the ORIGINAL decision, not a live
+			// re-read that a mid-verification `/setting adminview off`
+			// could poison.
+			if adminVisible {
+				if err := b.db.SetVerificationAdminBroadcast(chatID, userID, true); err != nil {
+					log.Printf("[WARN] persist admin_broadcast flag (chat=%d user=%d): %v", chatID, userID, err)
+				}
+				// Broadcast to admins as their own ephemerals if enabled.
+				// Failures here don't propagate — the joining user's session
+				// is already usable, admins missing an observation is a
+				// visibility loss, not a functional one.
+				b.broadcastAdminEphemerals(chatID, userID, 0, composedPath, caption, keyboard)
+			}
+			return nil
+		}
+	}
+
 	photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(composedPath))
 	photo.Caption = caption
 	photo.ParseMode = "HTML"
@@ -357,8 +414,10 @@ func (b *Bot) handleAdminApproveCallback(query *tgbotapi.CallbackQuery) {
 		log.Printf("[ERROR] Failed to record admin-approve event: %v", err)
 	}
 
-	b.applyVerificationSuccess(chatID, targetUserID, query.Message.MessageID)
-	b.sendMessage(chatID, b.t(query.From, "verify_admin_approved_msg"))
+	b.applyVerificationSuccess(chatID, targetUserID, pv)
+	approvedMsg := tgbotapi.NewMessage(chatID, b.t(query.From, "verify_admin_approved_msg"))
+	approvedMsg.ParseMode = "HTML"
+	b.sendPassNotice(approvedMsg)
 	b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_admin_approved_toast")))
 	log.Printf("[INFO] Admin %d approved user %d in chat %d", adminID, targetUserID, chatID)
 }
@@ -423,10 +482,7 @@ func (b *Bot) handleAdminBanCallback(query *tgbotapi.CallbackQuery) {
 	}
 
 	// Delete the verification message and the join service message.
-	deleteVerifyMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
-	if _, err := b.api.Request(deleteVerifyMsg); err != nil {
-		log.Printf("[DEBUG] Admin ban: failed to delete verification message (non-fatal): %v", err)
-	}
+	b.deleteVerificationMessageFor(pv, "admin-ban")
 	b.deleteJoinMessage(chatID, pv)
 
 	b.sendMessage(chatID, b.t(query.From, "verify_admin_banned_msg"))
@@ -500,23 +556,38 @@ func (b *Bot) handleAnswerCallback(query *tgbotapi.CallbackQuery) {
 		return
 	}
 	if step != pv.CurrentStep {
-		log.Printf("[WARN] Step mismatch: expected %d, got %d", pv.CurrentStep, step)
-		b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_order")))
+		// The tapped keyboard doesn't match the recorded step. The database
+		// is authoritative and the screen is what's stale: a redraw failed,
+		// its response was lost after Telegram applied it, Telegram dropped
+		// the edit event (it doesn't guarantee delivery), or a concurrent tap
+		// already advanced this step. Redraw the recorded step instead of
+		// rejecting, and never record an answer given against the wrong
+		// picture.
+		log.Printf("[WARN] Step mismatch for user %d: recorded %d, tapped %d — resyncing", targetUserID, pv.CurrentStep, step)
+		b.resyncVerificationStep(query, pv)
 		return
 	}
 
 	answers := append(pv.UserAnswers, selectedLabel)
 	newStep := step + 1
 
-	ok, err := b.db.UpdateVerificationStep(chatID, targetUserID, newStep, answers, version)
+	ok, err := b.db.UpdateVerificationStep(chatID, targetUserID, step, newStep, answers, version)
 	if err != nil {
 		log.Printf("[ERROR] Failed to update verification step: %v", err)
 		return
 	}
 	if !ok {
-		// Challenge regenerated between our read and write — discard this answer.
-		log.Printf("[WARN] Challenge regenerated during answer flow for user %d, discarding", targetUserID)
-		b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_expired")))
+		// Lost a race between our read and write: either the challenge was
+		// regenerated, or another tap advanced this step first. Re-read to
+		// tell them apart; neither records this answer.
+		current, rErr := b.db.GetPendingVerification(chatID, targetUserID)
+		if rErr != nil || current == nil || current.ChallengeVersion != version {
+			log.Printf("[WARN] Challenge regenerated during answer flow for user %d, discarding", targetUserID)
+			b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_expired")))
+			return
+		}
+		log.Printf("[WARN] Concurrent tap already advanced step %d for user %d, discarding", step, targetUserID)
+		b.resyncVerificationStep(query, current)
 		return
 	}
 
@@ -526,37 +597,128 @@ func (b *Bot) handleAnswerCallback(query *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	caption := b.t(query.From, "verify_step_prompt", formatUserMention(query.From), newStep, b.cfg.VerifyImageCount, newStep+1)
-
-	// Reconstruct option list from current keyboard, skipping the regenerate row (r:).
-	var options []string
-	if query.Message.ReplyMarkup != nil {
-		for _, row := range query.Message.ReplyMarkup.InlineKeyboard {
-			for _, btn := range row {
-				if btn.CallbackData == nil || !strings.HasPrefix(*btn.CallbackData, "v:") {
-					continue
-				}
-				btnParts := strings.SplitN((*btn.CallbackData)[2:], ":", 4)
-				if len(btnParts) == 4 {
-					options = append(options, btnParts[3])
-				}
-			}
-		}
+	if err := b.renderVerificationStep(query, pv, newStep, version); err != nil {
+		// The answer stays recorded. If the screen didn't change, the next
+		// tap lands on the previous step and resyncs; if Telegram applied
+		// the edit but the response was lost, screen and database already
+		// agree. Rolling back here would be wrong in that second case.
+		log.Printf("[ERROR] Failed to render step %d for user %d in chat %d: %v", newStep, targetUserID, chatID, err)
+		b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_retry")))
+		return
 	}
 
 	userLang := b.getUserLang(query.From)
-	showAdminControls := query.Message.Chat.Type != "private" && !pv.IsTest
-	keyboard := b.buildVerificationKeyboard(targetUserID, newStep, version, options, userLang, !pv.Regenerated, showAdminControls)
-
-	editMsg := tgbotapi.NewEditMessageCaption(chatID, query.Message.MessageID, caption)
-	editMsg.ParseMode = "HTML"
-	editMsg.ReplyMarkup = &keyboard
-	if _, err := b.api.Send(editMsg); err != nil {
-		log.Printf("[ERROR] Failed to update message caption: %v", err)
-	}
-
 	displayLabel := b.getDisplayLabelBySetLabel(selectedLabel, userLang)
 	b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_selected", displayLabel)))
+}
+
+// chooseChallengeMode decides whether this attempt gets an ephemeral
+// challenge, and whether admins get copies of it.
+//
+// A user who already failed once in this chat (holds a strike) gets the
+// regular public challenge instead. An ephemeral challenge can fail for
+// reasons that aren't the user's fault — a Telegram client too old to render
+// ephemeral messages shows nothing at all — and the next failure is a
+// permanent ban, so the last attempt uses the format every client supports.
+// If the strike lookup fails, the regular challenge is used for the same
+// reason: it is the format that cannot strand anyone.
+func (b *Bot) chooseChallengeMode(chatID, userID int64, isTest bool) (ephemeral, adminVisible bool) {
+	if chatID >= 0 || isTest {
+		return false, false
+	}
+	r := b.resolveChatSettings(chatID)
+	if !r.EphemeralOn {
+		return false, false
+	}
+	hasStrike, err := b.db.HasPreviousFailure(chatID, userID)
+	if err != nil {
+		log.Printf("[WARN] strike lookup failed for user %d in chat %d, using regular challenge: %v", userID, chatID, err)
+		return false, false
+	}
+	if hasStrike {
+		log.Printf("[INFO] User %d has a prior failure in chat %d, falling back to regular challenge", userID, chatID)
+		return false, false
+	}
+	return true, r.AdminVisible
+}
+
+// renderVerificationStep redraws the challenge's caption and keyboard for
+// newStep. Ephemeral challenges are edited through editEphemeralMessageCaption,
+// because their callbacks report message_id=0 and the regular edit can't
+// address them; admin-broadcast copies are refreshed too so admins watching
+// the attempt don't see it frozen on the first picture.
+func (b *Bot) renderVerificationStep(query *tgbotapi.CallbackQuery, pv *database.PendingVerification, newStep, version int) error {
+	chatID := query.Message.Chat.ID
+	caption := b.t(query.From, "verify_step_prompt", formatUserMention(query.From), newStep, b.cfg.VerifyImageCount, newStep+1)
+
+	options := pv.Options
+	if len(options) == 0 {
+		return fmt.Errorf("no answer options recorded for user %d", pv.UserID)
+	}
+
+	ephemeral := pv.EphemeralMessageID != 0
+	userLang := b.getUserLang(query.From)
+	// Admin controls never appear on ephemeral challenges: only the joiner
+	// can see that message, so admins could never tap them.
+	showAdminControls := query.Message.Chat.Type != "private" && !pv.IsTest && !ephemeral
+	keyboard := b.buildVerificationKeyboard(pv.UserID, newStep, version, options, userLang, !pv.Regenerated, showAdminControls)
+
+	if !ephemeral {
+		editMsg := tgbotapi.NewEditMessageCaption(chatID, query.Message.MessageID, caption)
+		editMsg.ParseMode = "HTML"
+		editMsg.ReplyMarkup = &keyboard
+		_, err := b.api.Send(editMsg)
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := b.editEphemeralMessageCaption(ctx, chatID, pv.UserID, pv.EphemeralMessageID, caption, keyboard); err != nil {
+		return err
+	}
+	if pv.AdminBroadcast {
+		b.refreshAdminEphemerals(ctx, chatID, pv.UserID, version, caption, keyboard)
+	}
+	return nil
+}
+
+// resyncVerificationStep redraws the challenge at the step the database has
+// recorded, for a tap made against a stale keyboard. The tapped answer is not
+// recorded. Once every step is answered the challenge is already being
+// evaluated, so there is nothing left to redraw.
+func (b *Bot) resyncVerificationStep(query *tgbotapi.CallbackQuery, pv *database.PendingVerification) {
+	if pv.CurrentStep >= b.cfg.VerifyImageCount {
+		b.api.Request(tgbotapi.NewCallback(query.ID, ""))
+		return
+	}
+	if err := b.renderVerificationStep(query, pv, pv.CurrentStep, pv.ChallengeVersion); err != nil {
+		log.Printf("[ERROR] Failed to resync step %d for user %d: %v", pv.CurrentStep, pv.UserID, err)
+		b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_retry")))
+		return
+	}
+	b.api.Request(tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_callback_resync")))
+}
+
+// refreshAdminEphemerals mirrors a step change onto every admin's copy of the
+// given challenge version. Rows from another version belong to a regenerated
+// challenge and must not be overwritten with this one's keyboard — an answer
+// handled just before a regenerate can reach this point after it.
+// Best-effort: a stale admin copy is a visibility gap, not a functional one,
+// so failures are logged and never block the joiner's progress.
+func (b *Bot) refreshAdminEphemerals(ctx context.Context, chatID, userID int64, version int, caption string, keyboard tgbotapi.InlineKeyboardMarkup) {
+	rows, err := b.db.ListAdminEphemerals(chatID, userID)
+	if err != nil {
+		log.Printf("[WARN] adminview: list admin ephemerals for refresh (chat=%d user=%d): %v", chatID, userID, err)
+		return
+	}
+	for _, r := range rows {
+		if r.ChallengeVersion != version {
+			continue
+		}
+		if err := b.editEphemeralMessageCaption(ctx, chatID, r.AdminID, r.EphemeralMessageID, caption, keyboard); err != nil {
+			log.Printf("[DEBUG] adminview: refresh admin=%d eid=%d: %v", r.AdminID, r.EphemeralMessageID, err)
+		}
+	}
 }
 
 // handleRegenerateCallback processes a r:{user}:{ver} button tap. Replaces the
@@ -608,7 +770,7 @@ func (b *Bot) handleRegenerateCallback(query *tgbotapi.CallbackQuery) {
 	defer b.composer.CleanupTempFile(composedPath)
 
 	newExpiresAt := time.Now().Add(time.Duration(b.cfg.VerifyTimeoutSeconds) * time.Second)
-	claimed, err := b.db.RegenerateVerification(chatID, targetUserID, correctLabels, newExpiresAt)
+	claimed, err := b.db.RegenerateVerification(chatID, targetUserID, correctLabels, newExpiresAt, allOptions)
 	if err != nil {
 		log.Printf("[ERROR] RegenerateVerification DB error for user %d: %v", targetUserID, err)
 		b.sendMessage(chatID, b.t(query.From, "verify_regenerate_failed"))
@@ -629,8 +791,56 @@ func (b *Bot) handleRegenerateCallback(query *tgbotapi.CallbackQuery) {
 		b.cfg.VerifyTimeoutSeconds,
 		b.cfg.VerifyImageCount,
 	)
-	showAdminControls := query.Message.Chat.Type != "private" && !pv.IsTest
+	// Admin controls stay off in ephemeral mode — admins can't see or
+	// tap them, so the buttons would be dead weight.
+	wasEphemeral := pv.EphemeralMessageID != 0
+	showAdminControls := query.Message.Chat.Type != "private" && !pv.IsTest && !wasEphemeral
 	keyboard := b.buildVerificationKeyboard(targetUserID, 0, newVersion, allOptions, userLang, false, showAdminControls)
+
+	// Ephemeral regenerate: send a new ephemeral, record its ID, delete
+	// the old ephemeral. Keeping the "record new then drop old" ordering
+	// so the sweeper always has a valid handle even if the delete fails.
+	if wasEphemeral {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		result, sendErr := b.sendPhotoEphemeral(
+			ctx, chatID, targetUserID,
+			composedPath, caption, keyboard, b.cfg.VerifySilentNotifications,
+		)
+		if sendErr != nil {
+			log.Printf("[ERROR] Failed to send regenerated ephemeral verification: %v", sendErr)
+			b.sendMessage(chatID, b.t(query.From, "verify_regenerate_failed"))
+			return
+		}
+		if uErr := b.db.UpdateVerificationEphemeralMessageID(chatID, targetUserID, result.EphemeralMessageID); uErr != nil {
+			// Same rollback posture as the initial send: without the
+			// persisted ID, cleanup can't find the new ephemeral. Delete
+			// what we just sent so it doesn't strand.
+			log.Printf("[ERROR] Failed to persist new ephemeral ID after regenerate (chat=%d user=%d), rolling back: %v",
+				chatID, targetUserID, uErr)
+			delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if delErr := b.deleteEphemeralMessage(delCtx, chatID, targetUserID, result.EphemeralMessageID); delErr != nil {
+				log.Printf("[WARN] rollback deleteEphemeralMessage after regenerate persist fail: %v", delErr)
+			}
+			delCancel()
+			b.sendMessage(chatID, b.t(query.From, "verify_regenerate_failed"))
+			return
+		}
+		// Delete the prior ephemeral (pv still carries its ID, we haven't
+		// mutated the struct in memory). This also drops any admin
+		// broadcasts for the OLD challenge — the re-broadcast below
+		// gives them a fresh copy of the new one.
+		b.deleteVerificationMessageFor(pv, "regenerate")
+		// Honor the ORIGINAL decision recorded on the pending row.
+		// Reading chat_settings live would let a mid-verification
+		// `/setting adminview off` leave orphan tracker rows around.
+		if pv.AdminBroadcast {
+			b.broadcastAdminEphemerals(chatID, targetUserID, newVersion, composedPath, caption, keyboard)
+		}
+		log.Printf("[INFO] Regenerated ephemeral verification for user %d in chat %d (new ver=%d, new_eid=%d)",
+			targetUserID, chatID, newVersion, result.EphemeralMessageID)
+		return
+	}
 
 	photo := tgbotapi.NewPhoto(chatID, tgbotapi.FilePath(composedPath))
 	photo.Caption = caption
@@ -721,6 +931,14 @@ func (b *Bot) evaluateVerification(query *tgbotapi.CallbackQuery, pv *database.P
 
 	if passed {
 		log.Printf("[INFO] User %d passed verification (%d/%d correct)", userID, correctCount, len(answers))
+		// Only a captcha the joiner solved themselves earns the cross-chat
+		// pass. Admin approvals go through handleAdminApproveCallback and never
+		// reach this point; test runs aren't joins.
+		if !pv.IsTest {
+			if err := b.db.MarkUserVerified(userID, chatID, database.VerifiedSourceCaptcha); err != nil {
+				log.Printf("[ERROR] Failed to add user %d to the pass list: %v", userID, err)
+			}
+		}
 		b.handleVerificationSuccess(query, pv)
 	} else {
 		log.Printf("[INFO] User %d failed verification (%d/%d correct)", userID, correctCount, len(answers))
@@ -730,10 +948,10 @@ func (b *Bot) evaluateVerification(query *tgbotapi.CallbackQuery, pv *database.P
 
 // applyVerificationSuccess performs the machine-side success path: clears the
 // stored failure record, unrestricts the target user, and deletes the
-// verification message. It does no user-facing messaging — that is the
-// caller's responsibility — so this is safe to call from contexts where the
-// initiator is an admin rather than the target user.
-func (b *Bot) applyVerificationSuccess(chatID, targetUserID int64, verificationMessageID int) {
+// verification message (regular or ephemeral). It does no user-facing
+// messaging — that is the caller's responsibility — so this is safe to call
+// from contexts where the initiator is an admin rather than the target user.
+func (b *Bot) applyVerificationSuccess(chatID, targetUserID int64, pv *database.PendingVerification) {
 	if err := b.db.ClearVerificationFailure(chatID, targetUserID); err != nil {
 		log.Printf("[ERROR] Failed to clear failure record: %v", err)
 	}
@@ -742,11 +960,125 @@ func (b *Bot) applyVerificationSuccess(chatID, targetUserID int64, verificationM
 		log.Printf("[WARN] Failed to unrestrict user (may already be admin): %v", err)
 	}
 
-	if verificationMessageID > 0 {
-		deleteMsg := tgbotapi.NewDeleteMessage(chatID, verificationMessageID)
-		if _, err := b.api.Request(deleteMsg); err != nil {
-			log.Printf("[DEBUG] Failed to delete verification message %d (non-fatal): %v", verificationMessageID, err)
+	b.deleteVerificationMessageFor(pv, "verify-passed")
+}
+
+// deleteVerificationMessageFor removes the challenge message associated
+// with pv, picking between the standard deleteMessage and the Bot API
+// 10.2 deleteEphemeralMessage based on which message ID the pv carries.
+// The zero value of EphemeralMessageID means "not ephemeral, use the
+// regular MessageID." Silently tolerates "already gone" errors — this
+// is called from cleanup paths where the message may have been deleted
+// by another actor. reason is a short tag for the debug log so operators
+// can trace which surface triggered the delete.
+//
+// Also drops any admin-broadcast ephemerals recorded for this pending
+// verification, so /setting adminview=on doesn't leave stale copies
+// piling up in admin views after the joining user's flow finishes.
+func (b *Bot) deleteVerificationMessageFor(pv *database.PendingVerification, reason string) {
+	if pv == nil {
+		return
+	}
+	if pv.EphemeralMessageID != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := b.deleteEphemeralMessage(ctx, pv.ChatID, pv.UserID, pv.EphemeralMessageID); err != nil {
+			log.Printf("[DEBUG] deleteEphemeralMessage failed (may already be gone) reason=%s chat=%d user=%d eid=%d: %v",
+				reason, pv.ChatID, pv.UserID, pv.EphemeralMessageID, err)
 		}
+		cancel()
+		if pv.AdminBroadcast {
+			b.deleteAdminEphemerals(pv.ChatID, pv.UserID, reason)
+		}
+		return
+	}
+	if pv.MessageID.Valid {
+		mid := int(pv.MessageID.Int64)
+		if mid == 0 {
+			return
+		}
+		if _, err := b.api.Request(tgbotapi.NewDeleteMessage(pv.ChatID, mid)); err != nil {
+			log.Printf("[DEBUG] Delete verification message failed (may already be gone) reason=%s chat=%d mid=%d: %v",
+				reason, pv.ChatID, mid, err)
+		}
+	}
+}
+
+// broadcastAdminEphemerals sends the same challenge to every group admin
+// as their own ephemeral message so admins can watch verifications
+// happen in real time. Skips the bot itself and any admin bots.
+// Failures per-admin are logged and swallowed — one admin missing an
+// observation shouldn't derail the join flow.
+//
+// challengeVersion is 0 for the initial send and pv.ChallengeVersion+1
+// on regenerate; stored so cleanup on partial regenerate races can tell
+// which broadcast belongs to which challenge.
+func (b *Bot) broadcastAdminEphemerals(
+	chatID, userID int64,
+	challengeVersion int,
+	composedPath, caption string,
+	keyboard tgbotapi.InlineKeyboardMarkup,
+) {
+	admins, err := b.api.GetChatAdministrators(tgbotapi.ChatAdministratorsConfig{
+		ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+	})
+	if err != nil {
+		log.Printf("[WARN] adminview: getChatAdministrators for chat=%d: %v", chatID, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sent := 0
+	for _, admin := range admins {
+		if admin.User == nil || admin.User.IsBot {
+			continue
+		}
+		if admin.User.ID == userID {
+			// The joining user IS an admin — they already got their
+			// own ephemeral, no point double-sending.
+			continue
+		}
+		result, sendErr := b.sendPhotoEphemeral(
+			ctx, chatID, admin.User.ID,
+			composedPath, caption, keyboard, true, // silent for admin observers
+		)
+		if sendErr != nil {
+			log.Printf("[WARN] adminview: send ephemeral to admin=%d chat=%d user=%d: %v",
+				admin.User.ID, chatID, userID, sendErr)
+			continue
+		}
+		if err := b.db.RecordAdminEphemeral(chatID, userID, admin.User.ID, result.EphemeralMessageID, challengeVersion); err != nil {
+			log.Printf("[ERROR] adminview: record admin ephemeral (chat=%d user=%d admin=%d): %v",
+				chatID, userID, admin.User.ID, err)
+		}
+		sent++
+	}
+	log.Printf("[INFO] adminview: broadcast challenge to %d admin(s) for chat=%d user=%d version=%d",
+		sent, chatID, userID, challengeVersion)
+}
+
+// deleteAdminEphemerals removes each admin-broadcast copy of the
+// challenge and clears the tracker rows. Called from
+// deleteVerificationMessageFor so success/fail/timeout/regenerate paths
+// clean up admin views uniformly.
+func (b *Bot) deleteAdminEphemerals(chatID, userID int64, reason string) {
+	rows, err := b.db.ListAdminEphemerals(chatID, userID)
+	if err != nil {
+		log.Printf("[WARN] adminview: list admin ephemerals for chat=%d user=%d: %v", chatID, userID, err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, r := range rows {
+		if err := b.deleteEphemeralMessage(ctx, chatID, r.AdminID, r.EphemeralMessageID); err != nil {
+			log.Printf("[DEBUG] adminview: deleteEphemeralMessage for admin=%d (reason=%s) eid=%d: %v",
+				r.AdminID, reason, r.EphemeralMessageID, err)
+		}
+	}
+	if err := b.db.DeleteAdminEphemerals(chatID, userID); err != nil {
+		log.Printf("[WARN] adminview: clear admin ephemerals tracker (chat=%d user=%d): %v", chatID, userID, err)
 	}
 }
 
@@ -777,7 +1109,7 @@ func (b *Bot) handleVerificationSuccess(query *tgbotapi.CallbackQuery, pv *datab
 		}
 	}
 
-	b.applyVerificationSuccess(chatID, userID, query.Message.MessageID)
+	b.applyVerificationSuccess(chatID, userID, pv)
 
 	// Send welcome message with elapsed time and links
 	log.Printf("[DEBUG] Sending welcome message to chat %d", chatID)
@@ -786,11 +1118,11 @@ func (b *Bot) handleVerificationSuccess(query *tgbotapi.CallbackQuery, pv *datab
 		userName += " " + query.From.LastName
 	}
 	welcomeText := b.t(query.From, "verify_passed", escapeHTML(userName))
-	
+
 	// Add timing information and links for test mode (private chat)
 	if isPrivateChat {
 		welcomeText += "\n\n" + b.t(query.From, "test_completion_time", fmt.Sprintf("%.2f", elapsedTime.Seconds()))
-		
+
 		// Add percentile information based on this completion time
 		percentile, err := b.db.GetTimePercentile(elapsedTime)
 		if err != nil {
@@ -798,20 +1130,18 @@ func (b *Bot) handleVerificationSuccess(query *tgbotapi.CallbackQuery, pv *datab
 		} else if percentile >= 0 {
 			welcomeText += "\n" + b.t(query.From, "test_percentile", fmt.Sprintf("%.0f", percentile))
 		}
-		
+
 		// Add retry and leaderboard links
 		retryLink := fmt.Sprintf("t.me/%s?start=retry_test", b.self.UserName)
 		leaderboardLink := "https://t.me/ING_reCAPTCHA_leaderboard/13"
 		welcomeText += "\n" + b.t(query.From, "test_retry_link", retryLink)
 		welcomeText += " | " + b.t(query.From, "test_leaderboard_link", leaderboardLink)
 	}
-	
+
 	welcomeMsg := tgbotapi.NewMessage(chatID, welcomeText)
 	welcomeMsg.ParseMode = "HTML"
 	welcomeMsg.DisableNotification = b.cfg.VerifySilentNotifications
-	if _, err := b.api.Send(welcomeMsg); err != nil {
-		log.Printf("[ERROR] Failed to send welcome message: %v", err)
-	}
+	b.sendPassNotice(welcomeMsg)
 
 	callback := tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_passed_callback"))
 	if _, err := b.api.Request(callback); err != nil {
@@ -835,15 +1165,8 @@ func (b *Bot) handleVerificationRetry(query *tgbotapi.CallbackQuery, pv *databas
 		log.Printf("[DEBUG] Incremented retry count to %d", retryCount)
 	}
 
-	// Delete old message
-	log.Printf("[DEBUG] Deleting old verification message %d", query.Message.MessageID)
-	deleteMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
-	resp, err := b.api.Request(deleteMsg)
-	if err != nil {
-		log.Printf("[ERROR] Failed to delete old verification message: %v", err)
-	} else {
-		log.Printf("[DEBUG] Successfully deleted old message, response: %+v", resp)
-	}
+	// Delete old message (regular or ephemeral)
+	b.deleteVerificationMessageFor(pv, "retry")
 
 	callback := tgbotapi.NewCallback(query.ID, b.t(query.From, "verify_failed_retry", b.cfg.VerifyMaxRetry-retryCount+1))
 	if _, err := b.api.Request(callback); err != nil {
@@ -872,15 +1195,8 @@ func (b *Bot) handleVerificationFailure(query *tgbotapi.CallbackQuery, pv *datab
 
 	log.Printf("[DEBUG] Handling verification failure for user %d in chat %d", userID, chatID)
 
-	// Delete verification message
-	log.Printf("[DEBUG] Deleting verification message %d", query.Message.MessageID)
-	deleteMsg := tgbotapi.NewDeleteMessage(chatID, query.Message.MessageID)
-	resp, err := b.api.Request(deleteMsg)
-	if err != nil {
-		log.Printf("[ERROR] Failed to delete verification message: %v", err)
-	} else {
-		log.Printf("[DEBUG] Successfully deleted message, response: %+v", resp)
-	}
+	// Delete verification message (regular or ephemeral)
+	b.deleteVerificationMessageFor(pv, "verify-failed")
 
 	// Check if user is admin (can't kick admins)
 	if b.isGroupAdmin(chatID, userID) {
@@ -1060,7 +1376,7 @@ func (b *Bot) sendLeaderboardUpdate() {
 	// Build leaderboard message
 	var sb strings.Builder
 	sb.WriteString("🏆 <b>Top 20 Leaderboard</b>\n\n")
-	
+
 	for _, entry := range entries {
 		medal := ""
 		switch entry.Rank {
@@ -1073,16 +1389,16 @@ func (b *Bot) sendLeaderboardUpdate() {
 		default:
 			medal = fmt.Sprintf("%d.", entry.Rank)
 		}
-		
+
 		name := escapeHTML(entry.FirstName)
 		if entry.LastName != "" {
 			name += " " + escapeHTML(entry.LastName)
 		}
-		
+
 		timeSeconds := float64(entry.CompletionTimeMs) / 1000.0
 		sb.WriteString(fmt.Sprintf("%s %s - %.2fs\n", medal, name, timeSeconds))
 	}
-	
+
 	sb.WriteString(fmt.Sprintf("\n<i>Updated: %s</i>", time.Now().Format("2006-01-02 15:04:05")))
 
 	// Create inline keyboard with "Start Test" button
@@ -1095,7 +1411,7 @@ func (b *Bot) sendLeaderboardUpdate() {
 	editMsg := tgbotapi.NewEditMessageText(b.cfg.LeaderboardChannelID, b.cfg.LeaderboardMessageID, sb.String())
 	editMsg.ParseMode = "HTML"
 	editMsg.ReplyMarkup = &keyboard
-	
+
 	if _, err := b.api.Send(editMsg); err != nil {
 		log.Printf("[ERROR] Failed to update leaderboard message: %v", err)
 	} else {

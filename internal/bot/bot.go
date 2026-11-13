@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/szres/ing-recaptcha/internal/bot/miniapp"
 	"github.com/szres/ing-recaptcha/internal/config"
 	"github.com/szres/ing-recaptcha/internal/database"
 	"github.com/szres/ing-recaptcha/internal/i18n"
@@ -33,6 +35,10 @@ type Bot struct {
 	updatePool chan struct{}
 	stopChan   chan struct{}
 	wg         sync.WaitGroup
+
+	// Optional Mini App server. Non-nil only when cfg.MiniAppEnabled is true.
+	miniappSrv    *miniapp.Server
+	miniappPoller *rawPoller
 }
 
 func New(cfg *config.Config, db *database.DB) (*Bot, error) {
@@ -81,11 +87,13 @@ func (b *Bot) Start() error {
 		log.Printf("[WARN] Failed to register bot commands with Telegram: %v", err)
 	}
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	u.AllowedUpdates = []string{"message", "callback_query", "chat_member"}
-
-	updates := b.api.GetUpdatesChan(u)
+	allowed := []string{"message", "callback_query", "chat_member"}
+	if b.cfg.MiniAppEnabled {
+		allowed = append(allowed, "chat_join_request")
+		if err := b.startMiniAppServer(); err != nil {
+			return fmt.Errorf("start mini app server: %w", err)
+		}
+	}
 
 	b.wg.Add(1)
 	go b.cleanupExpiredVerifications()
@@ -97,32 +105,362 @@ func (b *Bot) Start() error {
 	go b.cleanupFailureHistory()
 
 	b.wg.Add(1)
+	go b.ephemeralFallbackLoop()
+
+	b.wg.Add(1)
+	go b.autoDeleteLoop()
+
+	b.wg.Add(1)
 	go b.dailyStatsLoop()
+
+	if b.cfg.MiniAppEnabled {
+		b.wg.Add(1)
+		go b.cleanupMiniAppSessions()
+	}
 
 	log.Println("Bot started, listening for updates...")
 	log.Printf("Configuration: Images=%d, Required=%d, Timeout=%ds, Distractors=%d",
 		b.cfg.VerifyImageCount, b.cfg.VerifyRequiredCorrect,
 		b.cfg.VerifyTimeoutSeconds, b.cfg.VerifyDistractorCount)
+	if b.cfg.MiniAppEnabled {
+		log.Printf("Mini App enabled: listen=%s public=%s ttl=%ds", b.cfg.MiniAppListenAddr, b.cfg.MiniAppPublicURL, b.cfg.MiniAppSessionTTLSeconds)
+	}
 
-	for update := range updates {
+	// When Mini App is on we replace the v5 updates channel with our own
+	// raw poller, because the v5 lib's ChatJoinRequest struct doesn't
+	// expose query_id. Otherwise stay on the proven v5 long-poll path.
+	if b.cfg.MiniAppEnabled {
+		b.runRawUpdateLoop(allowed)
+	} else {
+		u := tgbotapi.NewUpdate(0)
+		u.Timeout = 60
+		u.AllowedUpdates = allowed
+		updates := b.api.GetUpdatesChan(u)
+		for update := range updates {
+			b.updatePool <- struct{}{}
+			go func(update tgbotapi.Update) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[ERROR] Panic in update handler: %v", r)
+					}
+					<-b.updatePool
+				}()
+				b.handleUpdate(update)
+			}(update)
+		}
+	}
+
+	return nil
+}
+
+// runRawUpdateLoop dispatches updates from the raw poller. chat_join_request
+// is dispatched synchronously inside the poller goroutine (so a crash can't
+// lose updates with a live 10-second query_id window); every other update
+// type is re-packed into v5.Update and handed to the existing fan-out.
+func (b *Bot) runRawUpdateLoop(allowed []string) {
+	b.miniappPoller = newRawPoller(b.token, allowed, b.handleChatJoinRequest)
+	defer b.miniappPoller.Stop()
+	for ru := range b.miniappPoller.Updates() {
+		ru := ru
 		b.updatePool <- struct{}{}
-		go func(update tgbotapi.Update) {
+		go func() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[ERROR] Panic in update handler: %v", r)
 				}
 				<-b.updatePool
 			}()
-			b.handleUpdate(update)
-		}(update)
+			b.handleRawUpdate(ru)
+		}()
+	}
+}
+
+// handleRawUpdate handles non-join-request updates from the raw poller by
+// re-packing them into v5.Update so the existing typed handlers can run
+// unchanged. chat_join_request updates never reach here — the poller
+// dispatches them synchronously instead.
+func (b *Bot) handleRawUpdate(ru rawUpdate) {
+	if ru.ChatJoinRequest != nil {
+		// Defense in depth: should not happen because the poller dispatches
+		// join requests synchronously. If it ever does, route it to the
+		// real handler so the update isn't dropped.
+		b.handleChatJoinRequest(ru.ChatJoinRequest)
+		return
+	}
+	u := tgbotapi.Update{
+		UpdateID:      ru.UpdateID,
+		Message:       ru.Message,
+		EditedMessage: ru.EditedMessage,
+		CallbackQuery: ru.CallbackQuery,
+		ChatMember:    ru.ChatMember,
+		MyChatMember:  ru.MyChatMember,
+	}
+	b.handleUpdate(u)
+}
+
+// startMiniAppServer constructs and launches the Mini App HTTP server.
+// Closures inject bot-side capabilities (challenge composition, Telegram
+// API calls, welcome message) without dragging the bot package into miniapp.
+func (b *Bot) startMiniAppServer() error {
+	if b.cfg.MiniAppPublicURL == "" {
+		return fmt.Errorf("MINIAPP_PUBLIC_URL is required when MINIAPP_ENABLED=true")
+	}
+	deps := miniapp.Deps{
+		DB:              b.db,
+		BotToken:        b.token,
+		SessionTTL:      time.Duration(b.cfg.MiniAppSessionTTLSeconds) * time.Second,
+		RequiredCorrect: b.cfg.VerifyRequiredCorrect,
+		ComposeChallenge: func() (string, []string, []string, error) {
+			return b.composeChallenge()
+		},
+		CleanupTempFile: func(path string) {
+			if err := b.composer.CleanupTempFile(path); err != nil {
+				log.Printf("[DEBUG] cleanup mini app temp file %s: %v", path, err)
+			}
+		},
+		ApproveJoinRequest: func(ctx context.Context, queryID string) error {
+			return b.answerChatJoinRequestQuery(ctx, queryID, "approve")
+		},
+		DeclineJoinRequest: func(ctx context.Context, queryID string) error {
+			return b.answerChatJoinRequestQuery(ctx, queryID, "decline")
+		},
+		ApproveJoinLegacy: func(_ context.Context, chatID, userID int64) error {
+			_, err := b.api.Request(tgbotapi.ApproveChatJoinRequestConfig{
+				ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+				UserID:     userID,
+			})
+			return err
+		},
+		DeclineJoinLegacy: func(_ context.Context, chatID, userID int64) error {
+			_, err := b.api.Request(tgbotapi.DeclineChatJoinRequest{
+				ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+				UserID:     userID,
+			})
+			return err
+		},
+		OnApproved: b.onMiniAppApproved,
+		OnDeclined: func(chatID, userID int64, reason string) {
+			b.notifyVerificationFailure(chatID, userID, reason)
+		},
+	}
+	b.miniappSrv = miniapp.New(b.cfg.MiniAppListenAddr, deps)
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		if err := b.miniappSrv.Start(); err != nil {
+			log.Printf("[ERROR] mini app server exited: %v", err)
+		}
+	}()
+	return nil
+}
+
+// onMiniAppApproved is invoked from the Mini App server immediately after a
+// successful answerChatJoinRequestQuery(approve). It sends the optional
+// silent welcome message in the group, mirroring the in-group flow.
+func (b *Bot) onMiniAppApproved(chatID, userID int64) {
+	if !b.cfg.WelcomeMessageInGroup {
+		return
+	}
+	user, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{ChatID: chatID, UserID: userID},
+	})
+	var mention string
+	if err == nil {
+		mention = formatUserMention(user.User)
+	} else {
+		mention = fmt.Sprintf("<code>%d</code>", userID)
+	}
+	text := b.i18n.T(b.cfg.DefaultLanguage, "verify_passed", mention)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "HTML"
+	msg.DisableNotification = b.cfg.VerifySilentNotifications
+	b.sendPassNotice(msg)
+}
+
+// cleanupMiniAppSessions ticks alongside the other DB cleanup loops to:
+//  1. Apply each chat's join_policy to any awaiting_dm session whose 5-min
+//     TTL has expired (the user didn't /start the bot in time).
+//  2. Expire stale standard pending sessions whose Mini App was opened
+//     but never solved.
+//  3. Drop in-memory challenges that outlived their session row.
+//  4. Delete session rows older than a day so the table stays small.
+func (b *Bot) cleanupMiniAppSessions() {
+	defer b.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-b.stopChan:
+			return
+		case <-ticker.C:
+			b.applyExpiredAwaitingDMPolicies()
+			if n, err := b.db.ExpireStaleMiniAppSessions(); err != nil {
+				log.Printf("[WARN] expire stale mini app sessions: %v", err)
+			} else if n > 0 {
+				log.Printf("[INFO] expired %d stale mini app session(s)", n)
+			}
+			if err := b.db.CleanupOldMiniAppSessions(24 * 3600); err != nil {
+				log.Printf("[WARN] cleanup mini app sessions: %v", err)
+			}
+			if b.miniappSrv != nil {
+				b.miniappSrv.ExpireStaleChallenges()
+			}
+		}
+	}
+}
+
+// applyExpiredAwaitingDMPolicies walks every session whose TTL has
+// passed AND whose join request can only be resolved by the bot
+// (awaiting_dm + pending-with-empty-query_id) and dispatches the
+// chat's configured fallback policy. Modern-flow pending sessions
+// (Telegram-native popup) are NOT included; those expire silently
+// via ExpireStaleMiniAppSessions and the request stays in Telegram's
+// queue for a human admin.
+func (b *Bot) applyExpiredAwaitingDMPolicies() {
+	stale, err := b.db.ListExpiredForPolicyFallback()
+	if err != nil {
+		log.Printf("[WARN] list expired for policy fallback: %v", err)
+		return
+	}
+	for _, s := range stale {
+		b.applyJoinPolicyFallback(s.ChatID, s.UserID, s.Nonce, "ttl-expired")
+	}
+}
+
+// applyJoinPolicyFallback dispatches the chat's configured join_policy for
+// a session that can't be completed via the Mini App flow (either because
+// the TTL expired or because we couldn't deliver the DM button). The
+// session is transitioned to 'expired' after the dispatch — even on
+// failure — so a transient Bot API error doesn't trap the row forever.
+//
+// reason is a short tag for the log line ("ttl-expired" or "dm-send-failed")
+// so operators can tell apart sweeper-driven and synchronous fallbacks.
+func (b *Bot) applyJoinPolicyFallback(chatID, userID int64, nonce, reason string) {
+	policy, err := b.db.GetChatJoinPolicy(chatID)
+	if err != nil {
+		log.Printf("[WARN] read join policy chat=%d: %v (using default 'approve')", chatID, err)
+		policy = ""
+	}
+	if policy == "" {
+		policy = database.JoinPolicyApprove
+	}
+	log.Printf("[INFO] applying join policy: chat=%d user=%d nonce=%s reason=%s policy=%s",
+		chatID, userID, nonce, reason, policy)
+	switch policy {
+	case database.JoinPolicyApprove:
+		if _, err := b.api.Request(tgbotapi.ApproveChatJoinRequestConfig{
+			ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+			UserID:     userID,
+		}); err != nil {
+			log.Printf("[ERROR] policy=approve approveChatJoinRequest chat=%d user=%d: %v", chatID, userID, err)
+		}
+	case database.JoinPolicyDecline:
+		if _, err := b.api.Request(tgbotapi.DeclineChatJoinRequest{
+			ChatConfig: tgbotapi.ChatConfig{ChatID: chatID},
+			UserID:     userID,
+		}); err != nil {
+			log.Printf("[ERROR] policy=decline declineChatJoinRequest chat=%d user=%d: %v", chatID, userID, err)
+		}
+	case database.JoinPolicyDismiss:
+		// Intentionally do nothing: the request stays pending for admins.
+	}
+	if _, mErr := b.db.MarkMiniAppSession(nonce, "expired"); mErr != nil {
+		log.Printf("[ERROR] mark session expired chat=%d nonce=%s: %v", chatID, nonce, mErr)
+	}
+	// Timeouts are "verification never completed" — surface to the same
+	// notification hook as an outright decline so an admin watching this
+	// chat can see abandoned attempts.
+	b.notifyVerificationFailure(chatID, userID, "ttl-"+reason)
+}
+
+// notifyVerificationFailure DMs each user in FailNotifyUserIDs about a
+// failed/timed-out verification, but only if chatID is one of the
+// watched groups (FailNotifyChatIDs). No-op when either list is empty.
+//
+// The applicant's username is looked up via getChatMember at notify
+// time (accurate but costs one API call per notification). If the
+// lookup fails we still send the notification with just the user_id
+// so the admin at least learns something happened.
+//
+// Kept intentionally best-effort: notification failures are logged but
+// never propagated — they must not affect the join-decision path.
+func (b *Bot) notifyVerificationFailure(chatID, userID int64, reason string) {
+	if len(b.cfg.FailNotifyChatIDs) == 0 || len(b.cfg.FailNotifyUserIDs) == 0 {
+		return
+	}
+	watched := false
+	for _, c := range b.cfg.FailNotifyChatIDs {
+		if c == chatID {
+			watched = true
+			break
+		}
+	}
+	if !watched {
+		return
 	}
 
-	return nil
+	username := ""
+	firstName := ""
+	if member, err := b.api.GetChatMember(tgbotapi.GetChatMemberConfig{
+		ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+			ChatID: chatID,
+			UserID: userID,
+		},
+	}); err == nil && member.User != nil {
+		username = member.User.UserName
+		firstName = member.User.FirstName
+	}
+
+	chatTitle := ""
+	if chat, err := b.api.GetChat(tgbotapi.ChatInfoConfig{ChatConfig: tgbotapi.ChatConfig{ChatID: chatID}}); err == nil {
+		chatTitle = chat.Title
+	}
+
+	handle := "<no username>"
+	if username != "" {
+		handle = "@" + username
+	}
+	nameLine := handle
+	if firstName != "" {
+		nameLine = firstName + " (" + handle + ")"
+	}
+	titleLine := chatTitle
+	if titleLine == "" {
+		titleLine = fmt.Sprintf("chat %d", chatID)
+	}
+
+	body := fmt.Sprintf(
+		"⚠️ Verification %s in <b>%s</b>\n\nUser: %s\nUser ID: <code>%d</code>",
+		escapeHTML(reason),
+		escapeHTML(titleLine),
+		escapeHTML(nameLine),
+		userID,
+	)
+	for _, recipient := range b.cfg.FailNotifyUserIDs {
+		msg := tgbotapi.NewMessage(recipient, body)
+		msg.ParseMode = "HTML"
+		msg.DisableWebPagePreview = true
+		if _, err := b.api.Send(msg); err != nil {
+			log.Printf("[WARN] failure notify to user=%d for chat=%d applicant=%d: %v",
+				recipient, chatID, userID, err)
+		}
+	}
 }
 
 func (b *Bot) Stop() {
 	log.Println("Stopping bot...")
-	b.api.StopReceivingUpdates()
+	if b.miniappPoller != nil {
+		b.miniappPoller.Stop()
+	} else {
+		b.api.StopReceivingUpdates()
+	}
+	if b.miniappSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := b.miniappSrv.Stop(ctx); err != nil {
+			log.Printf("[WARN] mini app shutdown: %v", err)
+		}
+		cancel()
+	}
 	close(b.stopChan)
 	b.wg.Wait()
 	log.Println("Bot stopped")
@@ -201,20 +539,8 @@ func (b *Bot) handleExpiredVerification(pv *database.PendingVerification) {
 		log.Printf("[ERROR] Failed to record expired verification event: %v", err)
 	}
 
-	// Delete verification message if exists
-	if pv.MessageID.Valid {
-		messageID := int(pv.MessageID.Int64)
-		log.Printf("[DEBUG] Attempting to delete message %d in chat %d", messageID, pv.ChatID)
-		deleteMsg := tgbotapi.NewDeleteMessage(pv.ChatID, messageID)
-		resp, err := b.api.Request(deleteMsg)
-		if err != nil {
-			log.Printf("[ERROR] Failed to delete verification message %d in chat %d: %v", messageID, pv.ChatID, err)
-		} else {
-			log.Printf("[DEBUG] Successfully deleted message %d, response: %+v", messageID, resp)
-		}
-	} else {
-		log.Printf("[DEBUG] No message ID to delete for user %d in chat %d", pv.UserID, pv.ChatID)
-	}
+	// Delete verification message (regular or ephemeral) if any.
+	b.deleteVerificationMessageFor(pv, "sweeper-expired")
 
 	// Check if user has previous failure
 	hasPreviousFailure, err := b.db.HasPreviousFailure(pv.ChatID, pv.UserID)
@@ -235,22 +561,20 @@ func (b *Bot) handleExpiredVerification(pv *database.PendingVerification) {
 		}
 		resp, err := b.api.Request(kickConfig)
 		if err != nil {
-			log.Printf("[ERROR] Failed to kick and ban user %d: %v", pv.UserID, err)
+			// Keep the strike: it's the only record that this user is due a
+			// permanent ban, so their next timeout attempts it again rather
+			// than starting over with a tempban.
+			log.Printf("[ERROR] Failed to permanently ban user %d in chat %d after 2nd timeout, keeping strike: %v", pv.UserID, pv.ChatID, err)
 		} else {
 			log.Printf("[DEBUG] Successfully kicked and banned user %d, response: %+v", pv.UserID, resp)
-
-			// Only delete join history if kick succeeded
 			if err := b.db.DeleteUserJoinHistory(pv.ChatID, pv.UserID); err != nil {
 				log.Printf("[ERROR] Failed to delete join history: %v", err)
 			}
+			if err := b.db.ClearVerificationFailure(pv.ChatID, pv.UserID); err != nil {
+				log.Printf("[ERROR] Failed to clear failure record: %v", err)
+			}
+			log.Printf("[INFO] User %d timed out (2nd time) in chat %d and was permanently banned", pv.UserID, pv.ChatID)
 		}
-
-		// Clear failure record after permanent ban
-		if err := b.db.ClearVerificationFailure(pv.ChatID, pv.UserID); err != nil {
-			log.Printf("[ERROR] Failed to clear failure record: %v", err)
-		}
-
-		log.Printf("[INFO] User %d timed out (2nd time) in chat %d and was permanently banned", pv.UserID, pv.ChatID)
 		b.deleteJoinMessage(pv.ChatID, pv)
 	} else {
 		// First failure - tempban (kick with UntilDate). Telegram auto-lifts
@@ -342,6 +666,9 @@ func (b *Bot) registerCommands() error {
 	groupCmds := []tgbotapi.BotCommand{
 		{Command: "start", Description: "Show welcome message and check setup"},
 		{Command: "help", Description: "Show help"},
+		{Command: "joinpolicy", Description: "Configure fallback for join requests without query_id"},
+		{Command: "setting", Description: "Configure per-group verification settings (ephemeral, adminview)"},
+		{Command: "setup", Description: "Check bot permissions and see setup instructions"},
 	}
 	privateCmds := []tgbotapi.BotCommand{
 		{Command: "start", Description: "Show welcome message"},

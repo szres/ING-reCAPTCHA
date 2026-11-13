@@ -7,7 +7,9 @@ import tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 type TelegramAPI interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
 	Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, error)
+	GetChat(config tgbotapi.ChatInfoConfig) (tgbotapi.Chat, error)
 	GetChatMember(config tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error)
+	GetChatAdministrators(config tgbotapi.ChatAdministratorsConfig) ([]tgbotapi.ChatMember, error)
 	GetFile(config tgbotapi.FileConfig) (tgbotapi.File, error)
 	GetMe() (tgbotapi.User, error)
 	GetUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel

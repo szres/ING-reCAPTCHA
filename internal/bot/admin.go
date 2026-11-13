@@ -21,6 +21,17 @@ func (b *Bot) cmdStart(msg *tgbotapi.Message, args string) {
 		}
 	}
 
+	// In DM, see if this user has any awaiting_dm Mini App sessions. The
+	// chat_join_request handler creates these when Telegram delivers a join
+	// request without query_id (older chat, older client, etc.); the bot
+	// waits up to MiniAppSessionTTLSeconds for the user to /start it so we
+	// can hand them the Mini App link directly. Multiple groups simultaneously
+	// pending verification → drain them all in one /start, one button per
+	// group.
+	if msg.Chat.Type == "private" && b.cfg.MiniAppEnabled {
+		b.deliverAwaitingDMSessions(msg.From.ID)
+	}
+
 	// In groups, /start is a setup probe. Check our own permissions so the
 	// group admin gets actionable feedback instead of a silent failure when
 	// the first user joins. Every group reply also gets the usage tip

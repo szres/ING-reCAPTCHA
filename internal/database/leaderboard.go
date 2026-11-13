@@ -32,7 +32,7 @@ func (db *DB) RecordLeaderboardEntry(userID int64, username, firstName, lastName
 			END,
 			completed_at = excluded.completed_at
 	`, userID, username, firstName, lastName, completionTime.Milliseconds(), time.Now().Unix())
-	
+
 	return err
 }
 
@@ -83,22 +83,28 @@ func (db *DB) GetTopLeaderboard(limit int) ([]LeaderboardEntry, error) {
 
 // GetUserRank returns a user's rank in the leaderboard (0 if not found)
 func (db *DB) GetUserRank(userID int64) (int, error) {
-	var rank int
-	err := db.QueryRow(`
-		SELECT COUNT(*) + 1
-		FROM leaderboard
-		WHERE completion_time_ms < (
-			SELECT completion_time_ms FROM leaderboard WHERE user_id = ?
-		)
-	`, userID).Scan(&rank)
-	
+	var userTime int64
+	err := db.QueryRow(
+		`SELECT completion_time_ms FROM leaderboard WHERE user_id = ?`,
+		userID,
+	).Scan(&userTime)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	
+
+	var rank int
+	err = db.QueryRow(`
+		SELECT COUNT(*) + 1
+		FROM leaderboard
+		WHERE completion_time_ms < ?
+	`, userTime).Scan(&rank)
+	if err != nil {
+		return 0, err
+	}
+
 	return rank, nil
 }
 
@@ -110,20 +116,20 @@ func (db *DB) GetUserPercentile(userID int64) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get total users: %w", err)
 	}
-	
+
 	if totalUsers == 0 {
 		return 0, nil
 	}
-	
+
 	rank, err := db.GetUserRank(userID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get user rank: %w", err)
 	}
-	
+
 	if rank == 0 {
 		return 0, nil
 	}
-	
+
 	// Calculate percentile: (total - rank) / total * 100
 	// If rank is 1 out of 10, beats 9 users = 90%
 	// If rank is 10 out of 10, beats 0 users = 0%
@@ -139,11 +145,11 @@ func (db *DB) GetTimePercentile(completionTime time.Duration) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get total users: %w", err)
 	}
-	
+
 	if totalUsers == 0 {
 		return 0, nil
 	}
-	
+
 	// Count how many users this time would beat (users with slower times)
 	var usersBeat int
 	err = db.QueryRow(`
@@ -154,7 +160,7 @@ func (db *DB) GetTimePercentile(completionTime time.Duration) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to count users beat: %w", err)
 	}
-	
+
 	// Calculate percentile: usersBeat / total * 100
 	percentile := float64(usersBeat) / float64(totalUsers) * 100
 	return percentile, nil

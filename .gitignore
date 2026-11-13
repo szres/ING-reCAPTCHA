@@ -4,6 +4,8 @@
 
 # Environment files
 .env
+.env.bak
+.env.*.bak
 
 # IDE
 .idea/
