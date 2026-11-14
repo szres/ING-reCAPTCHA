@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"strconv"
@@ -8,6 +9,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+
+	"github.com/szres/ing-recaptcha/internal/database"
 )
 
 func (b *Bot) handleMessage(msg *tgbotapi.Message) {
@@ -249,9 +252,9 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 }
 
 func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
-	log.Printf("[DEBUG] Chat member update: old status=%s, new status=%s, user=%d, chat=%d",
+	log.Printf("[DEBUG] Chat member update: old status=%s, new status=%s, user=%d, chat=%d, by=%d",
 		update.OldChatMember.Status, update.NewChatMember.Status,
-		update.NewChatMember.User.ID, update.Chat.ID)
+		update.NewChatMember.User.ID, update.Chat.ID, update.From.ID)
 
 	chatID := update.Chat.ID
 	userID := update.NewChatMember.User.ID
@@ -324,6 +327,11 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 		return
 	}
 
+	if adminID, ok := b.admittingAdmin(update); ok {
+		b.admitWithoutVerification(update, adminID)
+		return
+	}
+
 	// Check bot permissions in this chat
 	if !b.checkBotPermissions(chatID) {
 		log.Printf("[ERROR] Bot lacks required permissions in chat %d, cannot verify users", chatID)
@@ -392,6 +400,63 @@ func (b *Bot) handleChatMemberUpdate(update *tgbotapi.ChatMemberUpdated) {
 			log.Printf("[DEBUG] Drained cached join message ID %v for user %d", msgID, userID)
 		}
 	}
+}
+
+// groupAnonymousBotID is the account Telegram names as the performer of an
+// action taken by an administrator who is posting anonymously.
+const groupAnonymousBotID int64 = 1087968824
+
+// admittingAdmin reports which administrator of the chat, if any, brought
+// this member in — by approving their join request or by adding them — as
+// opposed to the user walking in, the bot approving them, or an ordinary
+// member adding them. An administrator letting someone in is the same act of
+// vouching as the Approve button on a challenge, and gets the same result.
+//
+// If the performer's status can't be looked up they are not treated as an
+// administrator, and the joiner is verified as usual.
+func (b *Bot) admittingAdmin(update *tgbotapi.ChatMemberUpdated) (int64, bool) {
+	performer := update.From
+	switch {
+	case performer.ID == 0, performer.ID == update.NewChatMember.User.ID:
+		return 0, false
+	case performer.ID == groupAnonymousBotID:
+		return performer.ID, true
+	case performer.IsBot:
+		// This bot's own approvals are handled above; another bot's are not
+		// an administrator's judgement.
+		return 0, false
+	}
+	return performer.ID, b.isGroupAdmin(update.Chat.ID, performer.ID)
+}
+
+// admitWithoutVerification lets in a member an administrator vouched for:
+// no mute and no challenge. They are not added to the pass list, so they are
+// verified like anyone else in the next chat they join.
+func (b *Bot) admitWithoutVerification(update *tgbotapi.ChatMemberUpdated, adminID int64) {
+	chatID := update.Chat.ID
+	user := update.NewChatMember.User
+
+	// A strike from an earlier attempt must not outlive the admin's decision:
+	// the tombstone filter would ban them on their first message.
+	if err := b.db.ClearVerificationFailure(chatID, user.ID); err != nil {
+		log.Printf("[ERROR] Failed to clear failure record for user %d in chat %d: %v", user.ID, chatID, err)
+	}
+	if closed, err := b.db.CloseActiveMiniAppSessions(chatID, user.ID); err != nil {
+		log.Printf("[ERROR] Failed to close mini app session for user %d in chat %d: %v", user.ID, chatID, err)
+	} else if closed > 0 {
+		log.Printf("[INFO] Closed %d pending mini app session(s) for user %d in chat %d", closed, user.ID, chatID)
+	}
+	if err := b.db.RecordVerificationEvent(database.VerificationEvent{
+		ChatID:      chatID,
+		UserID:      user.ID,
+		Outcome:     "passed",
+		UserLang:    b.getUserLang(user),
+		AdminUserID: sql.NullInt64{Int64: adminID, Valid: true},
+		OccurredAt:  time.Now().Unix(),
+	}); err != nil {
+		log.Printf("[ERROR] Failed to record admin admission event: %v", err)
+	}
+	log.Printf("[INFO] Skipping verification for user %d in chat %d — admitted by admin %d", user.ID, chatID, adminID)
 }
 
 // isVerifiedUser reports whether the user is on the global pass list — they

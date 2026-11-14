@@ -566,3 +566,40 @@ func TestMiniAppSessions_CleanupOldMiniAppSessions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "fresh", fresh.Nonce)
 }
+
+func TestCloseActiveMiniAppSessions_ClosesOnlyThatUsersOpenSessions(t *testing.T) {
+	db := newTestDB(t)
+	expires := time.Now().Add(5 * time.Minute).Unix()
+	seed := func(nonce, queryID string, chatID, userID int64, status string) {
+		t.Helper()
+		_, _, err := db.CreateMiniAppSession(nonce, queryID, chatID, userID, expires, status)
+		require.NoError(t, err)
+	}
+	seed("target-pending", "q", -100, 1, "pending")
+	seed("other-user", "q", -100, 2, "pending")
+	seed("other-chat", "", -200, 1, "awaiting_dm")
+	seed("approved-earlier", "q", -300, 1, "pending")
+	ok, err := db.MarkMiniAppSession("approved-earlier", "approving")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	closed, err := db.CloseActiveMiniAppSessions(-100, 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), closed)
+
+	want := map[string]string{
+		"target-pending":   "expired",
+		"other-user":       "pending",
+		"other-chat":       "awaiting_dm",
+		"approved-earlier": "approving",
+	}
+	for nonce, status := range want {
+		sess, err := db.GetMiniAppSession(nonce)
+		require.NoError(t, err)
+		assert.Equal(t, status, sess.Status, nonce)
+	}
+
+	again, err := db.CloseActiveMiniAppSessions(-100, 1)
+	require.NoError(t, err)
+	assert.Zero(t, again, "nothing left to close")
+}

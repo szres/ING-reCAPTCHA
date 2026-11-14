@@ -443,6 +443,26 @@ func (db *DB) HasRecentMiniAppApproval(chatID, userID int64, withinSeconds int) 
 // Runs from a background ticker so abandoned rows don't pile up and so
 // the unique partial index for active sessions eventually frees up for
 // new join attempts.
+// CloseActiveMiniAppSessions ends the bot's own verification of a join request
+// that has been settled some other way (an administrator admitted the user),
+// and reports how many sessions it closed. Without this the session would
+// run to its deadline and the join-policy fallback would then try to approve
+// or decline a request that no longer exists, and report a failed
+// verification for someone who is already a member.
+func (db *DB) CloseActiveMiniAppSessions(chatID, userID int64) (int64, error) {
+	res, err := db.Exec(
+		`UPDATE miniapp_sessions
+		    SET status = 'expired', completed_at = strftime('%s','now')
+		  WHERE chat_id = ? AND user_id = ?
+		    AND status IN ('pending', 'awaiting_dm')`,
+		chatID, userID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("close active mini app sessions: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 func (db *DB) ExpireStaleMiniAppSessions() (int64, error) {
 	res, err := db.Exec(
 		`UPDATE miniapp_sessions
