@@ -21,6 +21,8 @@ type mockTelegramAPI struct {
 	chatMemberFn       func(tgbotapi.GetChatMemberConfig) (tgbotapi.ChatMember, error)
 	sendErr            error
 	sentMessageID      int
+	rawRequests        []rawRequest
+	rawRequestErr      error
 	requestErr         error
 }
 
@@ -43,6 +45,22 @@ func (m *mockTelegramAPI) Request(c tgbotapi.Chattable) (*tgbotapi.APIResponse, 
 	}
 
 	return &tgbotapi.APIResponse{Ok: true}, m.requestErr
+}
+
+// rawRequest is one MakeRequest call: a Bot API method invoked by name.
+type rawRequest struct {
+	Endpoint string
+	Params   tgbotapi.Params
+}
+
+func (m *mockTelegramAPI) MakeRequest(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rawRequests = append(m.rawRequests, rawRequest{Endpoint: endpoint, Params: params})
+	if m.rawRequestErr != nil {
+		return nil, m.rawRequestErr
+	}
+	return &tgbotapi.APIResponse{Ok: true}, nil
 }
 
 func (m *mockTelegramAPI) GetChat(cfg tgbotapi.ChatInfoConfig) (tgbotapi.Chat, error) {

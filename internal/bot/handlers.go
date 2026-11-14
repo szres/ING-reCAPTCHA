@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -531,27 +532,46 @@ func (b *Bot) restrictUser(chatID, userID int64) error {
 	return err
 }
 
+// liftedPermissions grants every member permission the Bot API documents.
+// "Pass True for all permissions to lift restrictions from a user" is the
+// API's contract for restrictChatMember: the user goes back to being an
+// ordinary member, and what they may do is then decided by the chat's own
+// default permissions, not by this list.
+//
+// Every permission is named because one that is left out is not left alone:
+// Telegram denies it or derives it from another (can_edit_tag and
+// can_manage_topics follow can_pin_messages, can_react_to_messages follows
+// can_send_messages). Granting only the rights that existed when the bot was
+// written, with pinning held back, left every verified member permanently
+// restricted and unable to edit their own tag.
+const liftedPermissions = `{` +
+	`"can_send_messages":true,` +
+	`"can_send_audios":true,` +
+	`"can_send_documents":true,` +
+	`"can_send_photos":true,` +
+	`"can_send_videos":true,` +
+	`"can_send_video_notes":true,` +
+	`"can_send_voice_notes":true,` +
+	`"can_send_polls":true,` +
+	`"can_send_other_messages":true,` +
+	`"can_add_web_page_previews":true,` +
+	`"can_react_to_messages":true,` +
+	`"can_edit_tag":true,` +
+	`"can_change_info":true,` +
+	`"can_invite_users":true,` +
+	`"can_pin_messages":true,` +
+	`"can_manage_topics":true` +
+	`}`
+
+// unrestrictUser lifts the mute placed on a joiner by restrictUser. It goes
+// through MakeRequest rather than the library's typed config because that
+// struct predates most of today's permissions and cannot express them.
 func (b *Bot) unrestrictUser(chatID, userID int64) error {
-	permissions := tgbotapi.ChatPermissions{
-		CanSendMessages:       true,
-		CanSendMediaMessages:  true,
-		CanSendOtherMessages:  true,
-		CanAddWebPagePreviews: true,
-		CanSendPolls:          true,
-		CanInviteUsers:        true,
-		CanPinMessages:        false,
-		CanChangeInfo:         false,
-	}
-
-	restrictConfig := tgbotapi.RestrictChatMemberConfig{
-		ChatMemberConfig: tgbotapi.ChatMemberConfig{
-			ChatID: chatID,
-			UserID: userID,
-		},
-		Permissions: &permissions,
-	}
-
-	_, err := b.api.Request(restrictConfig)
+	_, err := b.api.MakeRequest("restrictChatMember", tgbotapi.Params{
+		"chat_id":     strconv.FormatInt(chatID, 10),
+		"user_id":     strconv.FormatInt(userID, 10),
+		"permissions": liftedPermissions,
+	})
 	return err
 }
 

@@ -142,6 +142,7 @@ func TestHandleChatMemberUpdate_VerifiedUserJoinsUntouched(t *testing.T) {
 	mock.mu.Unlock()
 	assert.Zero(t, requests, "no restriction, no kick")
 	assert.Zero(t, sends, "no challenge message")
+	assert.Empty(t, rawRequests(mock), "their permissions are left exactly as the group has them")
 	pv, err := b.db.GetPendingVerification(passChatID, passUserID)
 	require.NoError(t, err)
 	assert.Nil(t, pv)
